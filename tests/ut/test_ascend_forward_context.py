@@ -910,3 +910,26 @@ def test_extra_ctx_env_true_uses_additional_kwargs(monkeypatch):
     assert afc._EXTRA_CTX.capturing is False
     assert forward_context.capturing is True
     assert forward_context.additional_kwargs["capturing"] is False
+
+
+@pytest.mark.parametrize("is_draft_model", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 8, 32])
+def test_full_graph_torch_offload_uses_complete_shard_for_target_and_draft(
+    monkeypatch, is_draft_model, num_tokens
+):
+    from vllm.config import CUDAGraphMode
+
+    _patch_select_moe_comm_method_deps(
+        monkeypatch, device_type=AscendDeviceType.A5, capacity=48, ep_world_size=2
+    )
+    monkeypatch.setattr(
+        afc, "get_ascend_config",
+        lambda: SimpleNamespace(expert_offload_config=SimpleNamespace(
+            expert_offload=True, enable_multi_card=True, h2d_backend="torch"
+        )),
+    )
+    config = _make_vllm_config()
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    assert afc.select_moe_comm_method(
+        num_tokens, config, is_draft_model=is_draft_model
+    ) == MoECommType.ALLTOALL

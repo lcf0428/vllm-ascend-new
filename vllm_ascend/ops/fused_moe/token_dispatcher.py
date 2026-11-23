@@ -25,8 +25,9 @@ from typing import Generic
 
 import torch
 import torch_npu
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
@@ -49,6 +50,11 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
     TMoECombineMetadata,
 )
 from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_sequence_parallel_region
+from vllm_ascend.ops.fused_moe.static_ep import (
+    StaticEPCombineMetadata,
+    combine_static_ep,
+    dispatch_static_ep,
+)
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import should_skip_allreduce_across_dp_group
 
@@ -449,7 +455,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         return final_hidden_states
 
 
-class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]):
+class TokenDispatcherWithAll2AllV(
+    MoETokenDispatcher[MoEAllToAllCombineMetadata | StaticEPCombineMetadata]
+):
     """
     The implementation of the AlltoAll-based token dispatcher, which handles token
     dispatching on the sequence level instead of token level. The core of this implementation
@@ -486,6 +494,23 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+        full_graph = (
+            is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+        if full_graph:
+            offload = get_ascend_config().expert_offload_config
+            if (
+                offload.expert_offload is True
+                and offload.enable_multi_card is True
+                and offload.h2d_backend == "torch"
+            ):
+                if self.lora_context is not None:
+                    raise ValueError("Static full-shard EP does not support MoE LoRA")
+                return dispatch_static_ep(
+                    token_dispatch_input, self.ep_group, self.ep_rank, self.ep_size,
+                    self.num_experts, self.num_local_experts,
+                )
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
         with_quant = (
             token_dispatch_input.quant.dispatch_with_quant
@@ -571,6 +596,9 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
+
+        if isinstance(combine_metadata, StaticEPCombineMetadata):
+            return combine_static_ep(hidden_states, combine_metadata, self.ep_group)
 
         # 1. Preprocess using metadata
         hidden_states = self._combine_preprocess(hidden_states, combine_metadata)

@@ -31,6 +31,7 @@ from vllm_ascend.expert_offload.h2d_transfer import (
 )
 from vllm_ascend.expert_offload.load_buffer_pool import LoadBufferPool
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
+from vllm_ascend.expert_offload.prefill_transfer import ExpertPoolAdapter, PoolTransferScheduler
 from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
@@ -2357,8 +2358,12 @@ class ExpertOffloadManager:
     def _prefill_pipe_active(self) -> bool:
         """Pipelined prefill loads are available whenever the prefill pool
         is in use: _prefill_kick_load relies only on the slot-event table."""
+        # Multi-card prefill already loads the local EP shard through
+        # _prefill_load_layer_shard. The single-card pipeline iterates global
+        # experts and must not launch cross-rank reads after that forward.
         # No background Prefill reader may outlive rotating Host ownership.
         return (self._prefill_initialized and not self._skip_prefill
+                and not self.enable_multi_card
                 and getattr(self, "_exclusive_pool", None) is None)
 
     def _prefill_pipe_update(self, layer_idx: int) -> None:
@@ -2515,6 +2520,21 @@ class ExpertOffloadManager:
         pool_slot = layer_idx % ndl
         shard = self.mc_shard_size
         base = self.ep_rank * shard
+
+        if self.offload_config.h2d_backend == "torch" and not self.native_mxfp4_enabled:
+            scheduler = getattr(self, "_pool_transfer_scheduler", None)
+            if scheduler is None:
+                if torch.npu.is_current_stream_capturing():
+                    raise RuntimeError("Expert pool scheduler must be initialized by eager warmup")
+                scheduler = PoolTransferScheduler(ExpertPoolAdapter(self))
+                self._pool_transfer_scheduler = scheduler
+            # Async H2D and the consuming GMM run on the same current stream.
+            # All copies are graph nodes: every replay reloads every layer.
+            scheduler.submit(layer_idx, pool_slot)
+            return
+
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("This expert-pool backend has no capture-safe transfer adapter")
 
         if self.offload_config.h2d_backend == "memfabric":
             with torch_npu.npu.stream(self.load_stream):
@@ -3803,6 +3823,9 @@ class ExpertOffloadManager:
                 candidate.transport.copier.close()
             candidates.clear()
             self._device_prefetch_graph_refs.clear()
+        scheduler = getattr(self, "_pool_transfer_scheduler", None)
+        if scheduler is not None:
+            scheduler.close()
         transport = getattr(self, "h2d_transport", None)
         if transport is not None:
             transport.synchronize(self.load_stream)

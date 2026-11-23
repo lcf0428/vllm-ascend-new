@@ -204,11 +204,10 @@ def set_ascend_forward_context(
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
         forward_context.draft_moe_quant_type = draft_moe_quant_type
         if _should_skip_compiled_for_multi_card_offload(moe_comm_type):
-            # Multi-card offload uses an MC2 device buffer for decode and an
-            # ALLTOALL expert pool for prefill. These paths have different
-            # weight placement and dispatcher state, so they must not share a
-            # compiled graph. FULL_DECODE_ONLY still compiles and captures the
-            # graphable MC2 decode path while ALLTOALL prefill runs eagerly.
+            # Resident-cache MC2 and the full local-shard pool have different
+            # weight placement and dispatcher state. Do not share a compiled
+            # graph between them. The FULL wrapper captures pool H2D and static
+            # EP collectives directly; uncaptured prefill uses dynamic AllToAll.
             forward_context.skip_compiled = True
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -467,6 +466,15 @@ def select_moe_comm_method(
         # num_device_experts remains a free knob: smaller => more batches use
         # the full-expert pool.
         _offload_config = get_ascend_config().expert_offload_config
+        if (
+            getattr(_offload_config, "h2d_backend", "torch") == "torch"
+            and getattr(vllm_config.compilation_config, "cudagraph_mode", CUDAGraphMode.NONE).decode_mode()
+            == CUDAGraphMode.FULL
+        ):
+            # A FULL graph must not page a route-dependent resident cache.
+            # Use the complete local EP shard for target and draft forwards;
+            # its dispatcher records fixed-shape device collectives in graphs.
+            return MoECommType.ALLTOALL
         # Communication selection is process-wide rather than layer-specific,
         # so use the smallest configured layer capacity as the safe bound.
         # Replicated CPU weights allow arbitrary cross-rank placement. SHARED

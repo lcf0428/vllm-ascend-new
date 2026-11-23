@@ -985,3 +985,26 @@ def test_multi_card_hot_preload_loads_only_rank_owned_experts(tmp_path):
     assert manager._mc_lrc is manager.cache_policy
     manager.cache_policy.seed_layer_hotness.assert_called_once_with(0, {0: 0.9, 1: 0.8, 4: 0.5, 5: 0.4})
     layer.log2phy.copy_.assert_called_once_with(manager.log2phy_h)
+
+
+def test_multi_card_prefill_done_does_not_kick_single_card_pipeline():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    layer = object()
+    manager.moe_layers = [layer, object()]
+    manager.enable_multi_card = True
+    manager._prefill_initialized = True
+    manager._skip_prefill = False
+    manager._prefill_kick_load = MagicMock()
+    with patch("torch.npu.is_current_stream_capturing", return_value=False):
+        manager.on_prefill_layer_done(layer)
+    manager._prefill_kick_load.assert_not_called()
+
+
+def test_single_card_prefill_pipeline_remains_available():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.enable_multi_card = False
+    manager._prefill_initialized = True
+    manager._skip_prefill = False
+    assert manager._prefill_pipe_active()
+    manager._skip_prefill = True
+    assert not manager._prefill_pipe_active()
