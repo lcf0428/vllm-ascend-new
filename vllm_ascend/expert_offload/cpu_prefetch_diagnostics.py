@@ -166,3 +166,34 @@ class CpuPrefetchTrace:
         handle, self._handle = self._handle, None
         if handle:
             self._close(handle)
+
+
+class NullCpuPrefetchTrace:
+    """No diagnostic library, files or background activity for shared offload."""
+
+    path = None
+
+    def __init__(self):
+        self._static_sequence = 0
+
+    def next_static_id(self):
+        self._static_sequence += 1
+        return self._static_sequence
+
+    def begin_callback(self, layer, static_id):
+        return None
+
+    def mark(self, phase, arg0=0, arg1=0):
+        pass
+
+    def end_callback(self, previous):
+        pass
+
+    def mark_static(self, phase, layer, static_id, capturing, arg0=0, arg1=0):
+        pass
+
+    def mark_operation(self, phase, layer, task_id=0):
+        pass
+
+    def close(self):
+        pass

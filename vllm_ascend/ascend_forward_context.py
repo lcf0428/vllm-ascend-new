@@ -185,7 +185,17 @@ def set_ascend_forward_context(
             draft_moe_quant_type = getattr(draft_model_config, "draft_moe_quant_type", QuantType.NONE)
         else:
             draft_moe_quant_type = QuantType.NONE
+        offload = get_ascend_config().expert_offload_config
         actual_dp_rows = getattr(num_tokens_across_dp, "expert_offload_actual_rows", None)
+        if getattr(offload, "global_store_enabled", False) and vllm_config.parallel_config.data_parallel_size == 1:
+            # Dummy forwards and speculative sub-forwards can bypass runner DP
+            # coordination. Their own valid rows must drive admission and masks.
+            if num_actual_tokens is None:
+                num_actual_tokens = actual_dp_rows[0] if actual_dp_rows is not None else num_tokens
+            if not 0 <= num_actual_tokens <= num_tokens:
+                raise ValueError("Invalid unpadded DP token counts")
+            actual_dp_rows = [num_actual_tokens]
+            max_num_tokens = num_tokens
         moe_comm_type = select_moe_comm_method(
             max_num_tokens,
             vllm_config,
@@ -196,7 +206,6 @@ def set_ascend_forward_context(
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.expert_offload_graph_key = None
-        offload = get_ascend_config().expert_offload_config
         if getattr(offload, "global_store_enabled", False):
             forward_context.expert_offload_graph_key = (moe_comm_type, is_draft_model, 1)
             if moe_comm_type == MoECommType.ALLTOALL or not offload.global_store_config.graph["mc2_decode"]:

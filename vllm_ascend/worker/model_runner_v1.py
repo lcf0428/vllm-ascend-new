@@ -871,10 +871,17 @@ class NPUModelRunner(GPUModelRunner):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
-        if self.dp_size == 1:
-            return num_tokens, None, cudagraph_mode
-
         global_store = getattr(self.ascend_config.expert_offload_config, "global_store_enabled", False)
+        if self.dp_size == 1:
+            if not global_store:
+                return num_tokens, None, cudagraph_mode
+            actual_rows = num_tokens if num_actual_tokens is None else num_actual_tokens
+            if not 0 <= actual_rows <= num_tokens:
+                raise ValueError("Invalid unpadded DP token counts")
+            sizes = torch.tensor([num_tokens], device="cpu", dtype=torch.int32)
+            sizes.expert_offload_actual_rows = [actual_rows]
+            return num_tokens, sizes, cudagraph_mode
+
         if not global_store and should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
@@ -3782,7 +3789,10 @@ class NPUModelRunner(GPUModelRunner):
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        if (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            or getattr(self.ascend_config.expert_offload_config, "global_store_enabled", False)
+        ):
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,

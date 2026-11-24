@@ -19,7 +19,7 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import (
-    CpuPrefetchTrace, Phase as CpuPrefetchPhase,
+    CpuPrefetchTrace, NullCpuPrefetchTrace, Phase as CpuPrefetchPhase,
 )
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
@@ -122,8 +122,9 @@ class ExpertOffloadManager:
         self._global_model_id = str(vllm_config.model_config.model)
         if getattr(self.offload_config, "global_store_enabled", False):
             parallel = vllm_config.parallel_config
-            if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
-                raise ValueError("global_sharded version 1 requires TP=PP=1")
+            self.offload_config.global_store_config.validate_parallel(
+                parallel, enforce_eager=vllm_config.model_config.enforce_eager)
+            self._global_expected_ep_size = parallel.tensor_parallel_size * parallel.data_parallel_size
             capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
             self._global_max_rows = max([512, *capture_sizes])
         if self.offload_config.exclusive_expert_storage:
@@ -370,10 +371,13 @@ class ExpertOffloadManager:
         self._device_prefetch_init_ready = None
         self._cpu_prefetch_dispatcher = None
         self._cpu_prefetch_dma_stream = None
-        self._prefetch_trace = CpuPrefetchTrace(
-            library_path="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025/libcpu_prefetch_diag.so",
-            output_root="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025",
-        )
+        if getattr(self.offload_config, "global_store_enabled", False):
+            self._prefetch_trace = NullCpuPrefetchTrace()
+        else:
+            self._prefetch_trace = CpuPrefetchTrace(
+                library_path="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025/libcpu_prefetch_diag.so",
+                output_root="/mnt/sdc/y50063808/cpu_dma_dispatch_20261025",
+            )
         # NPU copy of gate weights for graph-capturable on-device prediction
         # (predict_next_layer_experts_npu). Kept in fp32.
         self._gate_weights_npu: list[torch.Tensor | None] = []
@@ -628,6 +632,31 @@ class ExpertOffloadManager:
             scale2_destination=scale2[destination_eid], name=name,
         )
 
+    def _validate_global_layer_layout(self, layer):
+        """A physical TP group may distribute tokens, never shard expert fields."""
+        from vllm.distributed.parallel_state import get_ep_group, get_tp_group
+
+        from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+        config = layer.moe_config
+        parallel = config.moe_parallel_config
+        ep_group = get_ep_group()
+        mc2_group = get_mc2_group()
+        if config.tp_size != 1 or parallel.tp_rank != 0:
+            raise ValueError("global_sharded requires complete experts (effective expert TP=1)")
+        if config.intermediate_size_per_partition != config.intermediate_size:
+            raise ValueError("global_sharded cannot publish TP-sharded expert weights")
+        if (ep_group.world_size != self._global_expected_ep_size
+                or config.ep_size != ep_group.world_size
+                or parallel.ep_rank != ep_group.rank_in_group):
+            raise ValueError("global_sharded expert layer and EP topology disagree")
+        if (tuple(ep_group.ranks) != tuple(mc2_group.ranks)
+                or ep_group.rank_in_group != mc2_group.rank_in_group):
+            raise ValueError("global_sharded requires matching EP and MC2 rank order")
+        tp_ranks = set(get_tp_group().ranks)
+        if not tp_ranks.issubset(ep_group.ranks):
+            raise ValueError("global_sharded requires the TP group within the EP group")
+
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
 
@@ -638,6 +667,8 @@ class ExpertOffloadManager:
             raise RuntimeError("Cannot register additional MoE layers after exclusive storage initialization")
         if getattr(self, "_global_store", None) is not None:
             raise RuntimeError("global_sharded version 1 cannot register offloaded layers after publication")
+        if getattr(self.offload_config, "global_store_enabled", False):
+            self._validate_global_layer_layout(layer)
         ntotal = layer.global_num_experts
         if getattr(self.offload_config, "global_store_enabled", False) and ntotal % self.ep_size:
             raise ValueError("global_sharded requires an even expert owner shard")

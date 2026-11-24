@@ -86,6 +86,22 @@ class GlobalStoreConfig:
             raise ValueError("graph.mc2_decode requires host_storage.mode=global_sharded")
         return cls(host, transport, placement, graph)
 
+    def validate_parallel(self, parallel, *, enforce_eager):
+        """Keep physical TP separate from the full-expert EP weight layout."""
+        if not self.enabled:
+            return
+        for name in ("pipeline_parallel_size", "prefill_context_parallel_size",
+                     "decode_context_parallel_size"):
+            if getattr(parallel, name, 1) != 1:
+                raise ValueError("global_sharded requires PP=PCP=DCP=1")
+        if not parallel.enable_expert_parallel:
+            raise ValueError("global_sharded requires enable_expert_parallel")
+        if getattr(parallel, "enable_eplb", False) or getattr(parallel, "enable_elastic_ep", False):
+            raise ValueError("global_sharded requires static EP without EPLB")
+        if parallel.tensor_parallel_size > 1:
+            if parallel.data_parallel_size != 1:
+                raise ValueError("global_sharded TP>1 currently requires DP=1")
+
     @property
     def enabled(self):
         return self.host["mode"] == "global_sharded"

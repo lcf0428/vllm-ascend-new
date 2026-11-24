@@ -62,7 +62,7 @@ class GlobalExpertStore:
             raise RuntimeError("Global expert publication failed: " + "; ".join(failures))
         manifests = [m for _, m in reports]
         expected = [self.key(i, eid) for i in range(len(layers)) for eid in range(world_size * len(experts) // len(layers))]
-        # Number of owned experts is uniform in version 1 (TP=PP=1).
+        # Each EP owner publishes an equal number of complete experts.
         self.directory = Directory(manifests, expected)
         error = None
         try:
