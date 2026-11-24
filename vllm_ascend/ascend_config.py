@@ -2027,6 +2027,10 @@ class ExpertOffloadConfig:
         #   (expert_offload/prefill_split.py).  Implies delta-load semantics.
         "prefill_delta_load": False,
         "prefill_split_gmm": False,
+        "host_storage": None,
+        "transport": None,
+        "placement": None,
+        "graph": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -2042,6 +2046,10 @@ class ExpertOffloadConfig:
                 else:
                     raise ValueError(f"Config has no attribute '{key}'")
 
+        from vllm_ascend.expert_offload.global_store.config import GlobalStoreConfig
+
+        self.global_store_config = GlobalStoreConfig.parse(user_config)
+        self.global_store_enabled = self.global_store_config.enabled
         self.cpu_moe = CpuMoeConfig(user_config.get("cpu_moe"))
         exclusive = self.config["exclusive_expert_storage"]
         if not isinstance(exclusive, bool):

@@ -11,7 +11,12 @@ if (BUILD_OPEN_PROJECT)
     )
 endif()
 
-add_modules_sources(OPTYPE kda_gate_cumsum ACLNNTYPE aclnn_exclude)
+if (NOT BUILD_OPS_RTY_KERNEL)
+    add_modules_sources(OPTYPE kda_gate_cumsum ACLNNTYPE aclnn_exclude)
+    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+endif()
 add_ops_compile_options(
     OP_NAME KdaGateCumsum
     OPTIONS --cce-auto-sync=off

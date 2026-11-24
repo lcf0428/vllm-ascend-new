@@ -371,11 +371,16 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_query_total = num_reqs * self.num_query_per_req
         num_query_tokens = min(num_query_total if num_reqs > 0 else num_tokens, self.max_query_tokens)
 
+        offload_dummy_actual = num_query_tokens
+        if getattr(self.runner.ascend_config.expert_offload_config, "global_store_enabled", False) and not is_profile:
+            active = kwargs.get("global_store_dummy_active", self.runner.dp_rank == 0)
+            offload_dummy_actual = num_query_tokens if active else 0
         (
             num_input_tokens,
             num_tokens_across_dp,
             _,
-        ) = self.runner._sync_metadata_across_dp(num_query_tokens, is_draft_model=True)
+        ) = self.runner._sync_metadata_across_dp(
+            num_query_tokens, is_draft_model=True, num_actual_tokens=offload_dummy_actual)
 
         if not self.use_cuda_graph:
             aclgraph_runtime_mode = CUDAGraphMode.NONE
@@ -391,7 +396,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_actual_tokens=num_input_tokens,
+            num_actual_tokens=offload_dummy_actual,
             in_profile_run=is_profile,
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=aclgraph_runtime_mode,

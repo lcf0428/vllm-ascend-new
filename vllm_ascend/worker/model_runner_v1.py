@@ -863,6 +863,7 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens: int,
         is_draft_model: bool = False,
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_actual_tokens: int | None = None,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
         # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
@@ -873,13 +874,16 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return num_tokens, None, cudagraph_mode
 
-        if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
+        global_store = getattr(self.ascend_config.expert_offload_config, "global_store_enabled", False)
+        if not global_store and should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
+        packed_tensor = torch.zeros(3 if global_store else 2, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        if global_store:
+            packed_tensor[2][self.dp_rank] = num_tokens if num_actual_tokens is None else num_actual_tokens
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
 
         # Unpack the results
@@ -888,7 +892,10 @@ class NPUModelRunner(GPUModelRunner):
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
 
         # Create a tensor for num_tokens_after_padding
-        comm_method = select_moe_comm_method(max_tokens_across_dp, self.vllm_config)
+        actual_rows = packed_tensor[2].tolist() if global_store else None
+        comm_method = select_moe_comm_method(max_tokens_across_dp, self.vllm_config,
+                                             is_draft_model=is_draft_model,
+                                             actual_tokens_across_dp=actual_rows)
         needs_uniform_moe_input = comm_method in {MoECommType.ALLGATHER, MoECommType.MC2}
         needs_uniform_mega_moe_input = comm_method == MoECommType.FUSED_MC2 and use_cann_megamoe(self.vllm_config)
         finegrained_tp = self.ascend_config.finegrained_tp_config
@@ -922,6 +929,10 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
+        if global_store:
+            # This CPU tensor travels unchanged from dispatch to forward context.
+            # Keep independent DP row counts alongside its padded execution sizes.
+            num_tokens_after_padding.expert_offload_actual_rows = actual_rows
         return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
 
     def get_model(self) -> nn.Module:
@@ -3718,6 +3729,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        offload_actual_tokens: int | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
@@ -3774,6 +3786,7 @@ class NPUModelRunner(GPUModelRunner):
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
+                num_actual_tokens=num_tokens if offload_actual_tokens is None else offload_actual_tokens,
             )
 
             # Extract DP padding if there is any
@@ -4371,6 +4384,14 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
+        # Capture each supported execution shape with one active DP source.
+        # Replay updates the mask and routes on every rank. This lets shape=8
+        # be captured even though four independent active shape=8 batches
+        # would exceed a global capacity of 128 and must run eagerly.
+        offload_dummy_actual = num_tokens_unpadded
+        if getattr(self.ascend_config.expert_offload_config, "global_store_enabled", False) and not is_profile:
+            capture_warmup = is_graph_capturing or cudagraph_runtime_mode not in (None, CUDAGraphMode.NONE)
+            offload_dummy_actual = num_tokens_unpadded if capture_warmup and self.dp_rank == 0 else 0
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
@@ -4390,6 +4411,7 @@ class NPUModelRunner(GPUModelRunner):
             # LoRA state when determining the batch descriptor for capture
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
+            offload_actual_tokens=offload_dummy_actual,
         )
         dcp_dummy_metadata = None
         if cudagraph_runtime_mode is None:
@@ -4662,7 +4684,8 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
                 in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
+                num_actual_tokens=(offload_dummy_actual if getattr(self.ascend_config.expert_offload_config, "global_store_enabled", False)
+                                   else num_tokens_padded),
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
@@ -4698,6 +4721,8 @@ class NPUModelRunner(GPUModelRunner):
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
+                    **({"global_store_dummy_active": offload_dummy_actual > 0}
+                       if getattr(self.ascend_config.expert_offload_config, "global_store_enabled", False) else {}),
                 )
             if is_profile and self.dynamic_eplb:
                 self.eplb_updator.adaptor.clear_all_moe_loads()

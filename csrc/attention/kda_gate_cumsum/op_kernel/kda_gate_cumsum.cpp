@@ -6,6 +6,7 @@
  */
 
 #include "kernel_operator.h"
+#include "kda_gate_cumsum_tiling_data.h"
 
 using namespace AscendC;
 
@@ -23,7 +24,7 @@ template <typename T, bool SAFE_GATE>
 class KdaGateCumsumKernel {
 public:
     __aicore__ inline void Init(GM_ADDR g, GM_ADDR aLog, GM_ADDR dtBias, GM_ADDR cuSeqlens, GM_ADDR gk,
-                                const KdaGateCumsumTilingData &tiling, TPipe *pipe)
+                                const KdaGateCumsumKernelTilingData &tiling, TPipe *pipe)
     {
         g_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(g));
         aLog_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(aLog));
@@ -292,7 +293,7 @@ private:
 
 template <typename T, bool SAFE_GATE>
 __aicore__ inline void RunKdaGateCumsum(GM_ADDR g, GM_ADDR aLog, GM_ADDR dtBias, GM_ADDR cuSeqlens, GM_ADDR gk,
-                                        const KdaGateCumsumTilingData &tilingData, TPipe *pipe)
+                                        const KdaGateCumsumKernelTilingData &tilingData, TPipe *pipe)
 {
     KdaGateCumsumKernel<T, SAFE_GATE> op;
     op.Init(g, aLog, dtBias, cuSeqlens, gk, tilingData, pipe);
@@ -301,7 +302,7 @@ __aicore__ inline void RunKdaGateCumsum(GM_ADDR g, GM_ADDR aLog, GM_ADDR dtBias,
 
 template <typename T>
 __aicore__ inline void DispatchKdaGateCumsumBySafeGate(GM_ADDR g, GM_ADDR aLog, GM_ADDR dtBias, GM_ADDR cuSeqlens,
-                                                       GM_ADDR gk, const KdaGateCumsumTilingData &tilingData,
+                                                       GM_ADDR gk, const KdaGateCumsumKernelTilingData &tilingData,
                                                        TPipe *pipe)
 {
     if (tilingData.safeGate != 0) {
@@ -318,7 +319,7 @@ extern "C" __global__ __aicore__ void kda_gate_cumsum(GM_ADDR g, GM_ADDR aLog, G
 {
     (void)workspace;
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    GET_TILING_DATA(tilingData, tiling);
+    GET_TILING_DATA_WITH_STRUCT(KdaGateCumsumKernelTilingData, tilingData, tiling);
     TPipe pipe;
     if (tilingData.dataType == 2) {
         DispatchKdaGateCumsumBySafeGate<float>(g, aLog, dtBias, cuSeqlens, gk, tilingData, &pipe);

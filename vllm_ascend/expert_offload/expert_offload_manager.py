@@ -1,6 +1,7 @@
 """Expert Offload Manager — manages CPU-side expert weights and NPU paging."""
 
 import ctypes
+import gc
 import json
 import logging
 import os
@@ -116,6 +117,15 @@ class ExpertOffloadManager:
 
         self.offload_config = get_ascend_config().expert_offload_config
         self._exclusive_pool = None
+        self._global_store = None
+        self._global_executor = None
+        self._global_model_id = str(vllm_config.model_config.model)
+        if getattr(self.offload_config, "global_store_enabled", False):
+            parallel = vllm_config.parallel_config
+            if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                raise ValueError("global_sharded version 1 requires TP=PP=1")
+            capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
+            self._global_max_rows = max([512, *capture_sizes])
         if self.offload_config.exclusive_expert_storage:
             parallel = vllm_config.parallel_config
             if any(size != 1 for size in (
@@ -626,7 +636,11 @@ class ExpertOffloadManager:
         """
         if getattr(self, "_exclusive_pool", None) is not None:
             raise RuntimeError("Cannot register additional MoE layers after exclusive storage initialization")
+        if getattr(self, "_global_store", None) is not None:
+            raise RuntimeError("global_sharded version 1 cannot register offloaded layers after publication")
         ntotal = layer.global_num_experts
+        if getattr(self.offload_config, "global_store_enabled", False) and ntotal % self.ep_size:
+            raise ValueError("global_sharded requires an even expert owner shard")
         if self.num_total_experts is None:
             self.num_total_experts = ntotal
         assert ntotal == self.num_total_experts, (
@@ -900,6 +914,8 @@ class ExpertOffloadManager:
         init, fp32 scale refresh, prefill pool creation, and gate weight
         registration.
         """
+        if getattr(self, "_global_store", None) is not None:
+            return
         if not self.moe_layers:
             return
         # Barrier: ensure all deferred load_w13/load_w2/_load_scale_shard
@@ -915,7 +931,10 @@ class ExpertOffloadManager:
         )
         t1 = time.perf_counter()
         self.process_weights_after_loading()
-        self._publish_shared_h2d_sources()
+        if getattr(self.offload_config, "global_store_enabled", False):
+            self._initialize_global_store()
+        else:
+            self._publish_shared_h2d_sources()
         t2 = time.perf_counter()
 
         num_moe_layers = len(self.moe_layers)
@@ -997,6 +1016,9 @@ class ExpertOffloadManager:
         t3 = time.perf_counter()
 
         ntotal = self.num_total_experts
+        # Padded graph rows can exceed the number of ACTIVE admitted rows.
+        if getattr(self.offload_config, "global_store_enabled", False):
+            self.offload_threshold = max(self.offload_threshold, self._global_max_rows)
         self.topk_ids_h = torch.zeros(
             [self.offload_threshold, self.topk], dtype=torch.int32, device="cpu", pin_memory=True
         )
@@ -1277,7 +1299,7 @@ class ExpertOffloadManager:
         """
         for layer_id, weights in enumerate(self.w13_weights_cpu):
             indices = [i for i, tensor in enumerate(weights) if tensor is not None]
-            if self.offload_config.exclusive_expert_storage:
+            if self.offload_config.exclusive_expert_storage or getattr(self.offload_config, "global_store_enabled", False):
                 for index in indices:
                     self._cast_cpu_expert_batch(layer_id, [index], mxfp4, w4a8_dynamic)
             else:
@@ -1722,6 +1744,8 @@ class ExpertOffloadManager:
 
     def load_w13(self, layer_moe_idx: int, expert_id: int, loaded_weight: torch.Tensor, shard_id: str):
         """Store w1/w3 shard to CPU buffer (transposed) via the load pool."""
+        if getattr(self, "_global_store", None) is not None:
+            raise RuntimeError("Global expert store is immutable after publication")
         self._weight_load_calls += 1
         if self.native_mxfp4_enabled:
             self._load_native_field(layer_moe_idx, expert_id, shard_id, "weight", loaded_weight)
@@ -1747,6 +1771,8 @@ class ExpertOffloadManager:
 
     def load_w2(self, layer_moe_idx: int, expert_id: int, loaded_weight: torch.Tensor):
         """Store w2 weight to CPU buffer (transposed) via the load pool."""
+        if getattr(self, "_global_store", None) is not None:
+            raise RuntimeError("Global expert store is immutable after publication")
         self._weight_load_calls += 1
         if self.native_mxfp4_enabled:
             self._load_native_field(layer_moe_idx, expert_id, "w2", "weight", loaded_weight)
@@ -1778,6 +1804,8 @@ class ExpertOffloadManager:
         _scale_shard_temp and assemble when the second shard arrives.
         w2 scale/offset is a single shard — clone and defer directly.
         """
+        if getattr(self, "_global_store", None) is not None:
+            raise RuntimeError("Global expert store is immutable after publication")
         self._weight_load_calls += 1
         if self.native_mxfp4_enabled:
             if attr_name not in ("w13_weight_scale", "w2_weight_scale"):
@@ -2017,7 +2045,10 @@ class ExpertOffloadManager:
             ):
                 continue
             dst = prefill_buffers[pool_slot][destination_eid]
-            if local_eid is not None and local_eid < len(cpu_buffers[attr_name][layer_idx]):
+            if getattr(self, "_global_store", None) is not None:
+                source = self._global_store.source(layer_idx, source_eid, attr_name)
+                nbytes = source.nbytes
+            elif local_eid is not None and local_eid < len(cpu_buffers[attr_name][layer_idx]):
                 pool = getattr(self, "_exclusive_pool", None)
                 src_tensor = (pool.source(layer_idx, source_eid)[attr_name] if pool is not None
                               else cpu_buffers[attr_name][layer_idx][local_eid])
@@ -2520,6 +2551,12 @@ class ExpertOffloadManager:
         pool_slot = layer_idx % ndl
         shard = self.mc_shard_size
         base = self.ep_rank * shard
+
+        if getattr(self, "_global_store", None) is not None:
+            if torch.npu.is_current_stream_capturing():
+                raise RuntimeError("global_sharded prefill must execute eagerly")
+            self._global_executor.run(self._global_prefill_load, layer_idx, pool_slot, base, shard)
+            return
 
         if self.offload_config.h2d_backend == "torch" and not self.native_mxfp4_enabled:
             scheduler = getattr(self, "_pool_transfer_scheduler", None)
@@ -3247,7 +3284,9 @@ class ExpertOffloadManager:
         # dispatch through the guarded wrapper rather than calling the tracer directly
         if from_graph_callback:
             self._log_mc_debug_schedule(layer_idx, is_prefetch=False)
-            torch_npu.npu._launch_host_func(current_compute_stream, self._update_weights_multi_card_guarded, args)
+            callback = (self._update_weights_multi_card_graph_guarded
+                        if getattr(self.offload_config, "global_store_enabled", False) else self._update_weights_multi_card_guarded)
+            torch_npu.npu._launch_host_func(current_compute_stream, callback, args)
         else:
             self._update_weights_multi_card_guarded(args)
         if do_substitution:
@@ -3265,6 +3304,8 @@ class ExpertOffloadManager:
         shard-per-rank: eid is GLOBAL; remap to this rank's local shard slot.
         Otherwise: the expert tensor's own (already pinned) storage, global eid.
         """
+        if getattr(self, "_global_store", None) is not None:
+            return self._global_store.source(layer_idx, eid, which)
         if getattr(self, "_exclusive_pool", None) is not None:
             return self._exclusive_pool.source(layer_idx, eid)[which].untyped_storage()
         if self.native_mxfp4_enabled:
@@ -3294,18 +3335,104 @@ class ExpertOffloadManager:
         return cpu_buf[eid].untyped_storage()
 
     def _shared_h2d_source(self, layer_idx, eid, name):
+        if getattr(self, "_global_store", None) is not None:
+            return self._global_store.source(layer_idx, eid, name)
         pointer = self._shared_h2d_sources.get((layer_idx, eid, name))
         if pointer is None:
             raise RuntimeError(f"Missing MemFabric SHARED source pointer: layer={layer_idx}, expert={eid}, name={name}")
         return HostPointerSource(pointer)
 
     def _shared_h2d_layer_ready(self, layer_idx: int) -> bool:
+        if getattr(self, "_global_store", None) is not None:
+            return self._global_store.ready and layer_idx < len(self._global_store.layers)
         if not getattr(self, "_shared_h2d_sources_ready", False):
             return False
         shared_sources = getattr(self, "_shared_h2d_sources", {})
         return all(
             (layer_idx, eid, name) in shared_sources for eid in range(self.num_total_experts) for name in ("w13", "w2")
         )
+
+    def _global_all_gather(self, value):
+        from torch import distributed as dist
+        from vllm.distributed.parallel_state import get_ep_group
+
+        if self.ep_size == 1:
+            return [value]
+        gathered = [None] * self.ep_size
+        config = self.offload_config.global_store_config
+        timeout = (config.host["startup_timeout_s"] if self._global_store is None
+                   else config.transport["timeout_s"])
+        timer = threading.Timer(timeout, self._global_timeout_exit)
+        timer.daemon = True
+        timer.start()
+        try:
+            dist.all_gather_object(gathered, value, group=get_ep_group().cpu_group)
+        finally:
+            timer.cancel()
+        return gathered
+
+    def _initialize_global_store(self):
+        from vllm_ascend.expert_offload.global_store.executor import TransferExecutor
+        from vllm_ascend.expert_offload.global_store.staging import StagingTransport
+        from vllm_ascend.expert_offload.global_store.store import GlobalExpertStore
+        from vllm_ascend.expert_offload.global_store.types import ExpertKey
+
+        if getattr(self, "_global_store", None) is not None:
+            return
+        config = self.offload_config.global_store_config
+        layers = [layer.layer_name for layer in self.moe_layers]
+        if len(set(layers)) != len(layers):
+            raise ValueError("Global expert directory requires unique layer names")
+        experts = []
+        for layer_idx, name in enumerate(layers):
+            for local in range(self._shard_size):
+                eid = self._shard_base + local
+                fields = {"w13": self.w13_weights_cpu[layer_idx][local],
+                          "w2": self.w2_weights_cpu[layer_idx][local]}
+                for buffers in (self.scale_cpu_buffers, self.offset_cpu_buffers, self.scale_bias_cpu_buffers):
+                    for attr, values in buffers.items():
+                        if layer_idx < len(values) and local < len(values[layer_idx]):
+                            fields[attr] = values[layer_idx][local]
+                experts.append((ExpertKey(self._global_model_id, "target", name, eid), fields))
+        staging = torch.empty(config.transport["staging_buffer_mb"] * (1 << 20),
+                              dtype=torch.uint8, device="cpu", pin_memory=True)
+        store = GlobalExpertStore(config, self.ep_rank, self.ep_size, self._global_all_gather,
+                                  self._global_model_id, layers, experts, staging)
+        # Preserve metadata expected by pool allocation, but point every owner
+        # tensor at the canonical MAP_SHARED region. No private full copy stays.
+        self._expert_h2d_views = {}
+        self._expert_h2d_tasks = {}
+        self._retired_expert_h2d_views = []
+        for layer_idx in range(len(layers)):
+            for local in range(self._shard_size):
+                eid = self._shard_base + local
+                for field, buffers in (("w13", self.w13_weights_cpu), ("w2", self.w2_weights_cpu)):
+                    buffers[layer_idx][local] = store.local_tensor(store.source(layer_idx, eid, field))
+                for buffers in (self.scale_cpu_buffers, self.offset_cpu_buffers, self.scale_bias_cpu_buffers):
+                    for attr, values in buffers.items():
+                        if layer_idx < len(values) and local < len(values[layer_idx]):
+                            values[layer_idx][local] = store.local_tensor(store.source(layer_idx, eid, attr))
+        fields.clear()
+        experts.clear()
+        gc.collect()
+        # Freed pinned tensors can otherwise remain in the process-local
+        # allocator cache as an entire extra owner shard. No server setting
+        # or other process's allocator is affected by this call.
+        torch_npu.npu.host_empty_cache()
+        self._global_store = store
+        self.h2d_transport = StagingTransport(store, staging, self._get_h2d_transport())
+        self._global_executor = TransferExecutor(self.load_stream.device, config.transport["timeout_s"])
+        logger.info("[GLOBAL-EXPERT-STORE] READY: EP=%d canonical_bytes=%d staging_bytes_per_rank=%d job=%s",
+                    self.ep_size, sum(m["size"] for m in store.directory.manifests.values()),
+                    staging.numel(), store.job_dir)
+
+    def _global_prefill_load(self, layer_idx, pool_slot, base, shard):
+        with torch_npu.npu.stream(self.load_stream):
+            for local, eid in enumerate(range(base, base + shard)):
+                tasks = self._build_prefill_h2d_tasks(layer_idx, pool_slot, eid, local)
+                self._get_h2d_transport().copy_batch(tasks)
+            self._refresh_prefill_fp32_scale(pool_slot, shard)
+            self._synchronize_h2d()
 
     def _publish_shared_h2d_sources(self) -> None:
         """All-gather peer shard pointers once after format conversion."""
@@ -3359,7 +3486,10 @@ class ExpertOffloadManager:
                 dst = self._cached_expert_h2d_view(
                     ("destination", layer_idx, slot, attr_name), dev_tensor, "index", slot
                 )
-                if local_eid is not None and local_eid < len(buffers[layer_idx]):
+                if getattr(self, "_global_store", None) is not None:
+                    source = self._global_store.source(layer_idx, eid, attr_name)
+                    nbytes = source.nbytes
+                elif local_eid is not None and local_eid < len(buffers[layer_idx]):
                     src_tensor = host_bundle[attr_name] if host_bundle is not None else buffers[layer_idx][local_eid]
                     source = self._cached_expert_h2d_view(
                         ("source", layer_idx, eid, attr_name), src_tensor, "reshape", tuple(dst.shape)
@@ -3537,7 +3667,7 @@ class ExpertOffloadManager:
             global_counts, self.ep_size, per_rank_slots, prev_log2phy, hotness, force_shard=force_shard
         )
         placement_ms = (time.perf_counter() - placement_start) * 1000.0 if placement_start is not None else 0.0
-        if cache_on:
+        if cache_on and getattr(self, "_global_store", None) is None:
             self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
         if self._debug:
             self._log_mc_decode_plan(layer_idx, global_counts, placement, per_rank_slots, counts_ms, placement_ms)
@@ -3572,7 +3702,26 @@ class ExpertOffloadManager:
         active_set = set(global_counts.nonzero(as_tuple=True)[0].tolist()) if global_counts is not None else None
         resident_map, hits, misses = self._compute_resident_hits(layer_idx, my_experts, cache_on, active_set)
         h2d_start = time.perf_counter() if self._debug and misses else None
-        if misses:
+        if getattr(self, "_global_store", None) is not None:
+            # Every rank, including one with no misses, participates in READY.
+            # Commit placement/cache only after all fields and derived scales
+            # are complete on every rank. Never recover by changing collective.
+            pending_resident = dict(resident_map)
+            failure = None
+            try:
+                if misses:
+                    self._global_executor.run(self._h2d_load_mc_misses, layer, layer_idx,
+                                              misses, pending_resident, debug_context)
+            except Exception as exc:
+                failure = f"rank={self.ep_rank}: {type(exc).__name__}: {exc}"
+            failures = [f for f in self._global_all_gather(failure) if f]
+            if failures:
+                raise RuntimeError("Expert materialization failed: " + "; ".join(failures))
+            resident_map.clear()
+            resident_map.update(pending_resident)
+            if cache_on:
+                self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
+        elif misses:
             self._h2d_load_mc_misses(layer, layer_idx, misses, resident_map, debug_context)
         h2d_ms = (time.perf_counter() - h2d_start) * 1000.0 if h2d_start is not None else 0.0
         # Write the FULL global placement into the pinned log2phy_h; the wrapper
@@ -3809,6 +3958,9 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        if getattr(self, "_global_executor", None) is not None:
+            self._global_executor.close()
+            self._global_executor = None
         worker = getattr(self, "_cpu_prefetch_dispatcher", None)
         if worker is not None:
             # close first drains registered prefetch streams while its worker
@@ -3834,6 +3986,14 @@ class ExpertOffloadManager:
         getattr(self, "_expert_h2d_views", {}).clear()
         getattr(self, "_retired_expert_h2d_views", []).clear()
         getattr(self, "_expert_h2d_tasks", {}).clear()
+        if getattr(self, "_global_store", None) is not None:
+            self.w13_weights_cpu.clear()
+            self.w2_weights_cpu.clear()
+            self.scale_cpu_buffers.clear()
+            self.offset_cpu_buffers.clear()
+            self.scale_bias_cpu_buffers.clear()
+            self._global_store.close()
+            self._global_store = None
 
     def _cached_expert_h2d_view(self, key, owner, kind, argument=None):
         """Reuse metadata views, never expert contents or routing values.
@@ -4156,6 +4316,18 @@ class ExpertOffloadManager:
             logger.exception("[EXPERT-EXCLUSIVE] fatal graph callback failure; terminating worker")
             os._exit(1)
 
+    @staticmethod
+    def _global_timeout_exit():
+        logger.error("[GLOBAL-EXPERT-STORE] timed out; terminating worker with transfer memory retained")
+        os._exit(1)
+
+    def _update_weights_multi_card_graph_guarded(self, args):
+        try:
+            self._update_weights_multi_card_guarded(args)
+        except BaseException:
+            logger.exception("[GLOBAL-EXPERT-STORE] fatal graph callback failure")
+            os._exit(1)
+
     def _update_weights_multi_card_guarded(self, args):
         """_update_weights_multi_card, same guard.
 
@@ -4163,10 +4335,21 @@ class ExpertOffloadManager:
         That was already being swallowed under replay; the guard only makes it
         loud. It is a hard configuration error, not a recoverable condition.
         """
+        timer = None
+        if getattr(self, "_global_store", None) is not None:
+            timer = threading.Timer(self.offload_config.global_store_config.transport["timeout_s"],
+                                    self._global_timeout_exit)
+            timer.daemon = True
+            timer.start()
         try:
             self._update_weights_multi_card(args)
-        except Exception:
+        except BaseException:
+            if getattr(self, "_global_store", None) is not None:
+                raise
             self._note_cb_failure("update_weights_multi_card")
+        finally:
+            if timer is not None:
+                timer.cancel()
 
     def _update_weights(self, args):
         # The reactive form is a 9-tuple. Substitution runs on device in

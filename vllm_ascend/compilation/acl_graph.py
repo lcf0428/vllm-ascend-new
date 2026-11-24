@@ -167,11 +167,13 @@ class ACLGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
-        if batch_descriptor not in self.concrete_aclgraph_entries:
+        graph_key = getattr(forward_context, "expert_offload_graph_key", None)
+        entry_key = (batch_descriptor, graph_key) if graph_key is not None else batch_descriptor
+        if entry_key not in self.concrete_aclgraph_entries:
             # create a new entry for this batch descriptor
-            self.concrete_aclgraph_entries[batch_descriptor] = ACLGraphEntry(batch_descriptor=batch_descriptor)
+            self.concrete_aclgraph_entries[entry_key] = ACLGraphEntry(batch_descriptor=batch_descriptor)
 
-        entry = self.concrete_aclgraph_entries[batch_descriptor]
+        entry = self.concrete_aclgraph_entries[entry_key]
 
         if entry.aclgraph is None:
             if self.aclgraph_options.debug_log_enable:
@@ -298,6 +300,11 @@ class ACLGraphWrapper:
             self._updatable_graph_replay(forward_context, entry.aclgraph)
         else:
             entry.aclgraph.replay()
+        if graph_key is not None:
+            # Version 1 shares one staging buffer and one set of Host router
+            # buffers. Complete this forward before another model/shape can
+            # reuse them; overlap is a later optimization.
+            torch.npu.current_stream().synchronize()
         logger.info_once("ACL graph replay is active (logged once).")
         return entry.output
 

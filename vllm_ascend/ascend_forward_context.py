@@ -185,14 +185,22 @@ def set_ascend_forward_context(
             draft_moe_quant_type = getattr(draft_model_config, "draft_moe_quant_type", QuantType.NONE)
         else:
             draft_moe_quant_type = QuantType.NONE
+        actual_dp_rows = getattr(num_tokens_across_dp, "expert_offload_actual_rows", None)
         moe_comm_type = select_moe_comm_method(
             max_num_tokens,
             vllm_config,
             is_draft_model=is_draft_model,
             draft_moe_quant_type=draft_moe_quant_type,
+            actual_tokens_across_dp=actual_dp_rows,
         )
 
         forward_context.moe_comm_type = moe_comm_type
+        forward_context.expert_offload_graph_key = None
+        offload = get_ascend_config().expert_offload_config
+        if getattr(offload, "global_store_enabled", False):
+            forward_context.expert_offload_graph_key = (moe_comm_type, is_draft_model, 1)
+            if moe_comm_type == MoECommType.ALLTOALL or not offload.global_store_config.graph["mc2_decode"]:
+                forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
         # A target and its drafter may own different expert shapes. Resolve
         # model-owned communication state before graph execution; legacy
         # models retain the original singleton implementation.
@@ -418,6 +426,7 @@ def select_moe_comm_method(
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
     draft_moe_quant_type: QuantType = QuantType.NONE,
+    actual_tokens_across_dp=None,
 ) -> MoECommType | None:
     """Select the MoE communication method from the active hardware policy,
     parallel settings, and token count.
@@ -468,6 +477,7 @@ def select_moe_comm_method(
         _offload_config = get_ascend_config().expert_offload_config
         if (
             getattr(_offload_config, "h2d_backend", "torch") == "torch"
+            and not getattr(_offload_config, "global_store_enabled", False)
             and getattr(vllm_config.compilation_config, "cudagraph_mode", CUDAGraphMode.NONE).decode_mode()
             == CUDAGraphMode.FULL
         ):
@@ -486,7 +496,7 @@ def select_moe_comm_method(
         _global_slots = min(_offload_config.num_device_experts_list)
         _ep_size = get_ep_group().world_size
         _h2d_backend = getattr(_offload_config, "h2d_backend", "torch")
-        _supports_global_placement = not _offload_config.shard_per_rank or (
+        _supports_global_placement = getattr(_offload_config, "global_store_enabled", False) or not _offload_config.shard_per_rank or (
             _h2d_backend == "memfabric" and not is_draft_model
         )
         _admission_slots = (
@@ -514,6 +524,17 @@ def select_moe_comm_method(
         # stay in collective lockstep, so multiplying this bound by EP size
         # can double-count routes. Use the local route bound for admission.
         _route_upper_bound = num_tokens * _topk
+        if getattr(_offload_config, "global_store_enabled", False):
+            from vllm_ascend.expert_offload.global_store.admission import route_upper_bound
+
+            _route_upper_bound = route_upper_bound(
+                num_tokens, vllm_config.parallel_config.data_parallel_size, _topk, actual_tokens_across_dp)
+            # Only capture shapes that are safe with one active DP rank.
+            # Larger padded shapes use eager ALLTOALL even with few real rows.
+            _route_upper_bound = max(_route_upper_bound, num_tokens * _topk)
+            # Draft MoE is not offloaded in version 1; retain the ordinary
+            # model-owned dispatcher, with conservative admission.
+
         _buffer_fits = _route_upper_bound <= _admission_slots
         if num_tokens <= mc2_tokens_capacity and num_tokens <= 512 and _buffer_fits:
             moe_comm_type = MoECommType.MC2
