@@ -32,7 +32,7 @@ def _expert(x, w13, w2, scale13, scale2):
     return (torch.nn.functional.silu(gate) * up).to(w2.dtype).matmul(w2).float() * scale2
 
 
-def _worker(rank, port, directory, full_graph=False, world_size=4, control_backend="gloo"):
+def _worker(rank, port, directory, full_graph=False, world_size=4, control_backend="gloo", staging_backend="torch"):
     # Lazy worker imports keep NPU initialization out of the spawning process.
     import torch_npu  # noqa: F401
     from vllm.config import CUDAGraphMode, set_current_vllm_config
@@ -67,7 +67,8 @@ def _worker(rank, port, directory, full_graph=False, world_size=4, control_backe
         "h2d_backend": "torch", "num_device_experts": [slots], "num_device_layers": 1,
         "cache_policy_enabled": True,
         "host_storage": {"mode": "global_sharded", "runtime_dir": str(Path(directory) / "store")},
-        "transport": {"staging_buffer_experts": 4, "timeout_s": 60, "control_backend": control_backend},
+        "transport": {"staging_buffer_experts": 4, "timeout_s": 60, "control_backend": control_backend,
+                      "staging_backend": staging_backend, "staging_submit_experts": 1},
         "graph": {"mc2_decode": full_graph},
     }
     cfg = EngineArgs(model=directory, tensor_parallel_size=world_size, enable_expert_parallel=True,
@@ -134,6 +135,15 @@ def _worker(rank, port, directory, full_graph=False, world_size=4, control_backe
             return read_into(source, offset, target, size)
 
         manager._global_store.read_into = count_read
+        if staging_backend == "native":
+            # Native packers read mapped pointers directly, bypassing Python read_into.
+            copy_batch = manager.h2d_transport.copy_batch
+
+            def count_native_read(tasks):
+                remote_reads[0] += sum(t.source.bundle.owner != rank for t in tasks)
+                return copy_batch(tasks)
+
+            manager.h2d_transport.copy_batch = count_native_read
         layer.log2phy = torch.full((experts,), -1, dtype=torch.int32, device="npu")
         layer.ascend_expert_map = torch.arange(slots, dtype=torch.int32, device="npu")
         layer.enable_multi_card = True
@@ -295,7 +305,7 @@ def _worker(rank, port, directory, full_graph=False, world_size=4, control_backe
         destroy_distributed_environment()
 
 
-def _run(full_graph=False, world_size=4, control_backend="gloo"):
+def _run(full_graph=False, world_size=4, control_backend="gloo", staging_backend="torch"):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -309,7 +319,7 @@ def _run(full_graph=False, world_size=4, control_backend="gloo"):
             "torch_dtype": "bfloat16",
         }
         (Path(directory) / "config.json").write_text(json.dumps(config))
-        mp.spawn(_worker, args=(port, directory, full_graph, world_size, control_backend),
+        mp.spawn(_worker, args=(port, directory, full_graph, world_size, control_backend, staging_backend),
                  nprocs=world_size, join=True)
 
 
@@ -329,3 +339,7 @@ def test_global_store_tp2_ep2_full_decode_graph():
 
 def test_global_store_tp2_ep2_full_shared_control():
     _run(full_graph=True, world_size=2, control_backend="shared_memory")
+
+
+def test_global_store_tp2_ep2_full_native_staging():
+    _run(full_graph=True, world_size=2, control_backend="shared_memory", staging_backend="native")

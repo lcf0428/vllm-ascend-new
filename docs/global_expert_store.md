@@ -406,3 +406,74 @@ Logs and the microbenchmark JSON are retained in
 `/data/l00955465/multi-card/runtime/staging_validation`.
 The full formatting hook could not initialize its Ruff environment because
 the configured GitHub proxy returned HTTP 407.
+
+## Native small-batch staging (2026-11-25)
+
+The opt-in native backend starts persistent CPU packers and reuses the existing
+materialization executor as its single submission thread. Canonical source
+addresses and physical layouts are registered at startup. Each layer passes
+descriptor IDs to a GIL-free C++ pipeline; the first completed chunk can be
+submitted while later chunks are still packing. Destinations are registered
+on first use and cached by address/layout, including fresh views of prefill slots.
+
+```json
+"transport": {
+  "control_backend": "shared_memory",
+  "staging_backend": "native",
+  "staging_buffer_experts": 48,
+  "staging_submit_experts": 2,
+  "staging_pack_threads": 2,
+  "timeout_s": 60
+}
+```
+
+`staging_buffer_experts` remains the total pinned capacity **per rank**, sized
+using the largest physical expert including quant attributes and aligned
+padding. A budget of 48 and submission size 2 creates 24 disjoint chunks.
+An odd remainder creates a smaller final chunk. `staging_submit_experts` must
+be positive and smaller than the budget; use 1 with a budget of 2. Worker
+count is an integer from 1 to 64. The default backend remains `torch`; the
+DP2 launcher explicitly selects `native`. `inter_node=disabled` and locally
+mapped canonical owners are required; TCP/RDMA continue using `torch`.
+
+Chunk lifecycle is FREE → FILLING → READY → IN_FLIGHT → FREE. FIFO jobs favor
+earlier chunks; event-protected reuse applies across both layer calls and
+single-expert prefill calls. Backpressure bounds all queued work to the ring.
+Weights use physical byte copies, preserving NZ storage. Quant attributes
+use ATen strided views, reshape and typed `copy_`, retaining any temporary
+allocation until completion. The native submitter drains torch-npu's host
+launch queue before mixing direct ACL copies with queued tensor operations,
+and before recording each completion event on the same load stream.
+
+Derived scale refresh, final load-stream synchronization, cross-rank READY,
+and placement/residency commit retain their existing order. This change does
+not move the planner, input polling or device completion notification into C++.
+Exceptions poison the native pipeline and propagate through the existing
+callback abort path; there is no automatic retry or backend switch in flight.
+
+The C++ extension is built once by rank 0 in the private job directory using
+the active interpreter's Torch ABI, Torch-NPU and CANN headers/libraries.
+All ranks check staging settings and startup failures. Compilation uses the
+startup timeout; subsequent materialization uses the transport timeout.
+The build needs a C++17 compiler and development headers. It does not install
+packages, modify shared compiler caches, bind host CPUs, or change system settings.
+
+To revert, set only `staging_backend` to `torch` and restart the service.
+The existing two-bank staging and shared-memory control remain available;
+`control_backend` is an independent choice. A running process keeps its loaded
+implementation until restart.
+
+`NativeStagingTransport.last_stats` exposes pack-worker CPU nanoseconds
+(summed across workers), ready-wait time, submission CPU time, time to first
+submission, total pipeline enqueue time and chunk count. These exclude the
+Python planner/descriptor setup and final DMA drain; they are not service TPOT.
+
+CPU regression tests exercise native workers with delayed asynchronous copies,
+odd budgets, bounded reuse, quant strides/dtype conversion, close/error paths,
+and GIL release. `benchmarks/expert_offload/benchmark_native_staging.py` compares
+whole-layer packing with chunk sizes 1/2/4 and worker counts 1/2/4 using a CPU
+DMA simulator. It measures CPU behavior, not PCIe or model throughput.
+Hardware acceptance tests are provided in
+`tests/e2e/pull_request/one_card/test_native_staging.py` (NZ plus quant fields)
+and `test_global_store_tp2_ep2_full_native_staging` (TP/EP FULL graph reuse).
+They have not been run for this backend because all NPUs were occupied.

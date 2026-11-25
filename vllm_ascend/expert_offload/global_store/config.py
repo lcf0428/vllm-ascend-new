@@ -35,6 +35,7 @@ class GlobalStoreConfig:
         transport = _section(values.get("transport"), {
             "intra_node": "shared_memory", "inter_node": "disabled",
             "control_backend": "gloo",
+            "staging_backend": "torch", "staging_submit_experts": 2, "staging_pack_threads": 2,
             "staging_buffer_experts": 4, "timeout_s": 60,
             "bind_address": "0.0.0.0", "advertise_address": None,
             "rdma_library": None,
@@ -56,6 +57,10 @@ class GlobalStoreConfig:
             raise ValueError("transport.inter_node must be disabled, tcp or rdma")
         if transport["control_backend"] not in ("gloo", "shared_memory"):
             raise ValueError("transport.control_backend must be gloo or shared_memory")
+        if transport["staging_backend"] not in ("torch", "native"):
+            raise ValueError("transport.staging_backend must be torch or native")
+        if transport["staging_backend"] == "native" and host["mode"] != "global_sharded":
+            raise ValueError("native staging requires host_storage.mode=global_sharded")
         if transport["control_backend"] == "shared_memory" and host["mode"] != "global_sharded":
             raise ValueError("shared_memory control requires host_storage.mode=global_sharded")
         if placement != {"scope": "ep_group", "policy": "stable"}:
@@ -63,6 +68,8 @@ class GlobalStoreConfig:
         if type(graph["mc2_decode"]) is not bool:
             raise TypeError("graph.mc2_decode must be boolean")
         for name, value in (("staging_buffer_experts", transport["staging_buffer_experts"]),
+                            ("staging_submit_experts", transport["staging_submit_experts"]),
+                            ("staging_pack_threads", transport["staging_pack_threads"]),
                             ("timeout_s", transport["timeout_s"]),
                             ("startup_timeout_s", host["startup_timeout_s"])):
             if type(value) is not int or value <= 0:
@@ -73,6 +80,13 @@ class GlobalStoreConfig:
             raise ValueError("rdma_gid_index must be nonnegative")
         if transport["staging_buffer_experts"] < 2:
             raise ValueError("staging_buffer_experts must be >= 2 (two banks total)")
+        if transport["staging_pack_threads"] > 64:
+            raise ValueError("staging_pack_threads must be <= 64")
+        if transport["staging_backend"] == "native":
+            if transport["staging_submit_experts"] >= transport["staging_buffer_experts"]:
+                raise ValueError("staging_submit_experts must be smaller than staging_buffer_experts")
+            if transport["inter_node"] != "disabled":
+                raise ValueError("native staging currently requires inter_node=disabled (locally mapped owners)")
         if host["mode"] == "global_sharded":
             if not host["runtime_dir"] or not Path(host["runtime_dir"]).is_absolute():
                 raise ValueError("global_sharded requires an absolute host_storage.runtime_dir")

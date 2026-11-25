@@ -3417,6 +3417,10 @@ class ExpertOffloadManager:
             return
         config = self.offload_config.global_store_config
         layers = [layer.layer_name for layer in self.moe_layers]
+        staging_settings = tuple(config.transport[name] for name in (
+            "staging_backend", "staging_buffer_experts", "staging_submit_experts", "staging_pack_threads"))
+        if any(settings != staging_settings for settings in self._global_all_gather(staging_settings)):
+            raise ValueError("Every rank must use the same staging backend, budget, chunk size and worker count")
         if len(set(layers)) != len(layers):
             raise ValueError("Global expert directory requires unique layer names")
         experts = []
@@ -3431,6 +3435,12 @@ class ExpertOffloadManager:
                             fields[attr] = values[layer_idx][local]
                 experts.append((ExpertKey(self._global_model_id, "target", name, eid), fields))
         bank_sizes = staging_buffer_sizes(experts, config.transport["staging_buffer_experts"])
+        chunk_counts = None
+        if config.transport["staging_backend"] == "native":
+            from vllm_ascend.expert_offload.global_store.native_staging import staging_chunk_layout
+
+            bank_sizes, chunk_counts = staging_chunk_layout(
+                experts, config.transport["staging_buffer_experts"], config.transport["staging_submit_experts"])
         if config.transport["inter_node"] == "rdma" and max(bank_sizes) > MAX_RDMA_READ_BYTES:
             raise ValueError("Each staging bank must be below 4 GiB for uint32 RDMA reads; "
                              "reduce staging_buffer_experts")
@@ -3458,13 +3468,24 @@ class ExpertOffloadManager:
         # allocator cache as an entire extra owner shard. No server setting
         # or other process's allocator is affected by this call.
         torch_npu.npu.host_empty_cache()
+        if chunk_counts is None:
+            self.h2d_transport = StagingTransport(store, staging, self._get_h2d_transport(), bank_sizes)
+        else:
+            from vllm_ascend.expert_offload.global_store.native_staging import create_native_staging
+
+            self.h2d_transport = create_native_staging(
+                store, staging, self._get_h2d_transport(), bank_sizes, chunk_counts)
+            logger.info("[GLOBAL-EXPERT-STORE] staging_backend=native submit_experts=%d pack_threads=%d chunks=%d",
+                        config.transport["staging_submit_experts"], config.transport["staging_pack_threads"],
+                        len(chunk_counts))
+        # Native compilation is startup work: retain startup_timeout_s until it
+        # and all source registration have completed on every rank.
         self._global_store = store
         self._cross_rank_control = SharedMemoryControl.bootstrap(store, self.num_total_experts, self._global_all_gather)
         if self._cross_rank_control is not None:
             self._control_watchdog = CallbackWatchdog(config.transport["timeout_s"], self._control_timeout_exit)
             logger.info("[GLOBAL-EXPERT-STORE] control_backend=shared_memory EP=%d bytes=%d job=%s",
                         self.ep_size, self._cross_rank_control.size, store.job_dir)
-        self.h2d_transport = StagingTransport(store, staging, self._get_h2d_transport(), bank_sizes)
         self._global_executor = TransferExecutor(self.load_stream.device, config.transport["timeout_s"])
         logger.info("[GLOBAL-EXPERT-STORE] READY: EP=%d canonical_bytes=%d staging_bytes_per_rank=%d "
                     "staging_buffer_experts=%d staging_bank_bytes=%s job=%s",

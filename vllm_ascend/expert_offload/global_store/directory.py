@@ -30,6 +30,10 @@ class Directory:
                 raise ValueError("Overlapping expert fields")
         if self.bundles.keys() != set(expected_keys):
             raise ValueError("Incomplete or unexpected global expert directory")
+        # Immutable canonical descriptors: reuse them across graph callbacks
+        # instead of invalidating the manager's cached H2D tasks every layer.
+        self._sources = {(key, field.name): Source(bundle, field)
+                         for key, bundle in self.bundles.items() for field in bundle.fields}
         # Every peer must consume exactly the same raw layout for a layer.
         layouts = {}
         for key, bundle in self.bundles.items():
@@ -39,5 +43,4 @@ class Directory:
                 raise ValueError(f"Incompatible expert layouts for {layer}")
 
     def source(self, key, name):
-        bundle = self.bundles[key]
-        return Source(bundle, next(f for f in bundle.fields if f.name == name))
+        return self._sources[(key, name)]
