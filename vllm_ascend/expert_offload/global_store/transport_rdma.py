@@ -57,8 +57,12 @@ class Verbs:
         self.lib.expert_rdma_close.restype = None
         self.lib.expert_rdma_connect.argtypes = [ctypes.c_void_p, ctypes.POINTER(Endpoint),
                                                 ctypes.POINTER(Endpoint)]
-        self.lib.expert_rdma_read.argtypes = [ctypes.c_void_p, ctypes.POINTER(Endpoint),
-                                             ctypes.c_uint64, ctypes.c_uint32, ctypes.c_double]
+        if not hasattr(self.lib, "expert_rdma_read_into"):
+            raise ValueError("RDMA library lacks staging-offset support; rebuild rdma_verbs.c")
+        self.lib.expert_rdma_read_into.argtypes = [ctypes.c_void_p, ctypes.POINTER(Endpoint),
+                                                  ctypes.c_uint64, ctypes.c_uint64,
+                                                  ctypes.c_uint32, ctypes.c_double]
+        self.lib.expert_rdma_read_into.restype = ctypes.c_int
 
     def open(self, address, size):
         endpoint = Endpoint()
@@ -162,7 +166,14 @@ class RDMAReader:
         if rank not in self.peers:
             self.connect(rank, endpoint)
         handle, peer, _ = self.peers[rank]
-        if self.verbs.lib.expert_rdma_read(handle, ctypes.byref(peer), offset, nbytes, self.timeout):
+        if nbytes <= 0 or nbytes >= (1 << 32) or nbytes > len(destination):
+            raise ValueError("Invalid RDMA staging read size")
+        address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
+        local_offset = address - self.staging.data_ptr()
+        if local_offset < 0 or local_offset + nbytes > self.staging.numel():
+            raise ValueError("RDMA destination is outside registered staging")
+        if self.verbs.lib.expert_rdma_read_into(handle, ctypes.byref(peer), offset,
+                                               local_offset, nbytes, self.timeout):
             # Preserve registered memory. Worker failure shuts down this QP.
             raise RuntimeError("Expert RDMA READ failed or timed out")
 

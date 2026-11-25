@@ -182,7 +182,8 @@ def test_published_store_cannot_be_reloaded_or_converted_twice():
 
 
 @pytest.mark.parametrize("fail", [True, False])
-def test_decode_commits_residency_and_mapping_only_after_global_ready(fail):
+@pytest.mark.parametrize("shared", [True, False])
+def test_decode_commits_residency_and_mapping_only_after_global_ready(fail, shared):
     namespace = {"torch": torch, "time": __import__("time")}
     method = production_method("expert_offload/expert_offload_manager.py", "ExpertOffloadManager",
                                "_update_weights_multi_card_impl", namespace)
@@ -214,6 +215,9 @@ def test_decode_commits_residency_and_mapping_only_after_global_ready(fail):
         _mc_prev_log2phy={0: previous}, _global_all_gather=gather,
         _h2d_load_mc_misses=copy, _global_executor=SimpleNamespace(run=lambda fn, *args: fn(*args)),
     )
+    if shared:
+        manager._cross_rank_control = SimpleNamespace(ready=lambda layer, failure: [f for f in gather(failure) if f])
+        manager._global_all_gather = Mock(side_effect=AssertionError("READY must not enter Gloo"))
     args = (torch.tensor([[0]], dtype=torch.int32), output_map, object(), 0, 2, False, None)
     if fail:
         with pytest.raises(RuntimeError, match="materialization failed"):
@@ -227,3 +231,56 @@ def test_decode_commits_residency_and_mapping_only_after_global_ready(fail):
         assert (output_map >= 0).all()
         assert manager._mc_prev_log2phy[0] is not previous
     assert len(ready_observations) == 1
+
+
+def test_shared_callback_uses_persistent_watchdog_and_publishes_abort():
+    namespace = {"threading": Mock(), "logger": logging.getLogger(__name__), "os": Mock()}
+    guarded = production_method("expert_offload/expert_offload_manager.py", "ExpertOffloadManager",
+                                "_update_weights_multi_card_guarded", namespace)
+    manager = SimpleNamespace(_global_store=object(), _control_watchdog=Mock(), _cross_rank_control=Mock(),
+                              _update_weights_multi_card=Mock(side_effect=ValueError("bad placement")))
+    with pytest.raises(ValueError, match="bad placement"):
+        guarded(manager, ())
+    namespace["threading"].Timer.assert_not_called()
+    manager._control_watchdog.arm.assert_called_once()
+    manager._control_watchdog.disarm.assert_called_once()
+    assert "bad placement" in manager._cross_rank_control.abort.call_args.args[0]
+
+
+@pytest.mark.parametrize("cache_on", [True, False])
+@pytest.mark.parametrize("with_scores", [True, False])
+def test_shared_statistics_use_combined_exchange_and_preserve_lrc_inputs(cache_on, with_scores):
+    method = production_method("expert_offload/expert_offload_manager.py", "ExpertOffloadManager",
+                               "_gather_global_counts_and_hotness", {"torch": torch})
+    ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]]) if with_scores else None
+    observed = []
+
+    def statistics(layer, counts, scores):
+        assert layer == 0
+        assert counts.tolist() == [1, 2, 1, 0]
+        if cache_on and with_scores:
+            assert scores.tolist() == [0.25, 1.25, 0.5, 0]
+        else:
+            assert scores is None
+        observed.append(True)
+        return counts * 2, None if scores is None else scores * 2
+
+    policy = SimpleNamespace(layer_states=[object()], observe_global_counts=Mock(),
+                             hotness_array=lambda _: [1.0] * 4)
+    manager = SimpleNamespace(
+        num_total_experts=4, offload_config=SimpleNamespace(cache_policy_enabled=cache_on),
+        _cross_rank_control=SimpleNamespace(statistics=statistics), _mc_lrc=policy, cache_policy=policy,
+        _mc_prev_log2phy={0: None}, _log_mc_lrc_state=Mock(),
+        _gather_cpu_with_mc_debug=Mock(side_effect=AssertionError("statistics must not enter Gloo")),
+    )
+    counts, enabled, _, _ = method(manager, 0, ids, None, weights)
+    assert counts.tolist() == [2, 4, 2, 0] and enabled == cache_on and observed == [True]
+    if cache_on:
+        actual_scores = policy.observe_global_counts.call_args.args[2]
+        if with_scores:
+            assert actual_scores.tolist() == [0.25, 0.625, 0.5, 0]
+        else:
+            assert actual_scores is None
+    else:
+        policy.observe_global_counts.assert_not_called()

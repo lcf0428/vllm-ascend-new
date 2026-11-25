@@ -44,7 +44,7 @@ Set these fields inside `expert_offload_config` in `--additional-config`:
   "transport": {
     "intra_node": "shared_memory",
     "inter_node": "disabled",
-    "staging_buffer_mb": 64,
+    "staging_buffer_experts": 4,
     "timeout_s": 60
   },
   "placement": {"scope": "ep_group", "policy": "stable"},
@@ -76,9 +76,30 @@ containers/namespaces may need a network transport even on one physical host.
 it requires enough backing filesystem space and can page to disk. No tmpfs
 mount, container configuration or server environment is changed automatically.
 
-Each rank has one pinned staging allocation, default 64 MiB. Raw weight fields
-larger than this are copied in chunks. A quantization field must fit staging;
-its logical shape/stride/dtype are preserved, including strided destinations.
+Each rank has one pinned allocation split into two DMA banks. Configure
+`transport.staging_buffer_experts` (integer >= 2, default 4): this is the
+**total expert capacity per rank across both banks**, not the resident-device
+expert count and not the capacity of each bank. With 4, each bank holds two
+experts; odd budgets split floor/ceil (3 gives 1+2).
+
+At startup, each field's actual `untyped_storage().nbytes()` is rounded up to
+64-byte alignment. The largest complete expert payload across all published
+layers, including weights, scales, offsets and biases, defines one budget
+unit. Total pinned bytes = this unit times `staging_buffer_experts`. Raw/NZ
+padding is included; there is no hardcoded model size or quantization type.
+For a 12.75 MiB expert whose fields already meet alignment, 4 experts allocate
+51 MiB per rank (25.5 MiB per bank). Startup logs the expert budget and both
+bank sizes. Increasing this setting changes Host staging memory, not HBM.
+
+Fields are packed into disjoint aligned ranges, submitted asynchronously on
+the load stream, and protected by a completion event per bank. Filling the
+other bank can overlap H2D. Only reuse of an unfinished bank waits; the final
+layer synchronization and distributed READY/commit protocol remain in place.
+Logical quant copies preserve shape/stride/dtype and retain temporary views
+until completion. Raw fields can still be chunked for custom small buffers.
+`staging_buffer_mb` is removed: replace it with `staging_buffer_experts` in old
+configurations; old input fails with an explicit migration error.
+
 There is no private full Host replica per reader. Device caches, bounded
 staging, checkpoint mappings and temporary startup conversion buffers are
 separate from the canonical store. Startup temporarily holds old owner
@@ -86,6 +107,59 @@ buffers and the new shared allocation; old buffers and their process-local
 pinned allocator cache are released after publication. This is not a zero-copy
 startup implementation. Published layers reject checkpoint reloading and
 repeated finalization cannot convert their bytes a second time.
+
+## Same-host control communication
+
+Set `transport.control_backend="shared_memory"` to replace per-layer CPU Gloo
+counts/router-score reductions and object-based materialization READY with a
+small, CPU-polled shared control mapping. The default remains `gloo`. The DP2
+launcher opts into `shared_memory`; its expert staging budget is unchanged.
+
+All EP ranks must map each other's canonical regions and the same control
+inode. Startup checks identical backend, expert count and timeout settings.
+An explicitly selected shared backend fails startup if these conditions are
+not met; it never changes to Gloo mid-execution. Multi-node groups use `gloo`.
+Bootstrap and canonical-store shutdown still use the existing object collective.
+Device dispatch/combine and worker-level DP synchronization are unchanged.
+
+Rank zero builds the bundled `control.c` with `cc` into its private, randomly
+named job directory during startup. This requires a C11 compiler, executable
+file mappings, and lock-free 64-bit CPU atomics (x86-64/AArch64). There is no
+CANN/Torch compilation, global installation or per-layer build. The control
+file and DSO are mode 0600; the existing job directory is mode 0700. Each rank
+maps the small file with MAP_SHARED; no explicit filesystem flush occurs in
+the hot path. Only these control files are removed during normal retirement.
+
+Counts and optional score sums share one publication. Native acquire/release
+atomics protect the payload; ctypes releases the GIL during native peer waits.
+Each call validates sequence, layer, operation and payload shape. Reader
+acknowledgements prevent fast ranks overwriting unread slots. A short bounded
+spin is followed by sleeping polls; this creates no dedicated spinning worker
+or global CPU-affinity changes. A missed deadline or callback exception
+publishes an immutable abort status so peers cannot silently continue.
+
+Planner and LRC logic remain on the existing Python path, with fixed-rank-order
+score summation in the shared backend. Floating-point sums may differ in their
+last bits from Gloo's reduction order for larger EP groups. READY still waits
+for every rank, including zero-miss ranks, to finish all weight/quantization
+work before residency and mapping are committed. One persistent watchdog
+replaces the per-callback Timer threads for the shared backend. Python graph
+callbacks, the transfer executor and final device stream synchronization remain;
+this stage does not implement native graph input polling or device-value release.
+
+CPU-only communication microbenchmark (no model or NPU execution):
+
+```bash
+python benchmarks/expert_offload/benchmark_shared_control.py \
+  --iterations 300 --output /path/to/private/control_benchmark.json
+```
+
+Tests cover two/four processes, repeated slot reuse, scores, operation/layer
+mismatch, delayed readers, timeout, abort propagation, bootstrap, GIL release,
+watchdog rearming and manager commit ordering. The TP2 FULL shared-control
+system test is `test_global_store_tp2_ep2_full_shared_control` in
+`tests/e2e/pull_request/four_card/test_global_expert_store_tp_eager.py`.
+Run hardware acceptance only with dedicated idle NPUs.
 
 ## Multi-node transports
 
@@ -108,7 +182,7 @@ Then set the transport section on each node, using its own address and device:
 {
   "intra_node": "shared_memory",
   "inter_node": "rdma",
-  "staging_buffer_mb": 64,
+  "staging_buffer_experts": 4,
   "timeout_s": 60,
   "bind_address": "0.0.0.0",
   "advertise_address": "NODE_REACHABLE_IP",
@@ -122,6 +196,9 @@ Then set the transport section on each node, using its own address and device:
 The backend uses libibverbs RC QPs and RDMA READ, from the remote registered
 canonical Host region into a local registered pinned staging buffer. TCP
 carries authenticated connection/QP metadata only. NPU H2D remains Torch.
+Rebuild the adapter after updating: the client now requires the
+`expert_rdma_read_into` entry point to address distinct banks and field ranges.
+An older library is rejected rather than silently overwriting bank zero.
 The same homogeneous native endpoint ABI is required on peers. Successful
 MR/QP creation is checked at bootstrap; reads fail explicitly on CQ error or
 timeout. InfiniBand/RoCE devices exposed through libibverbs are required;
@@ -149,7 +226,7 @@ also include communication method, target/draft role and layout version.
 
 Graph callbacks stage router IDs, compute a deterministic global placement,
 and submit materialization to a separate NPU worker thread/load stream. That
-thread waits after each staging-buffer reuse and refreshes derived scales.
+thread waits only before reusing an unfinished DMA bank and refreshes derived scales.
 Every rank participates in a READY/error exchange, including ranks with no
 misses. Residency and log2phy commit only after success. Callback failure or
 timeout terminates the service worker; it never continues with stale weights
@@ -166,6 +243,7 @@ CPU regression command (does not initialize a model or allocate NPU memory):
 cd /data/l00955465/multi-card/vllm-ascend
 /data/l00955465/multi-card/.venv-dp4-ep4/bin/python -m pytest --noconftest -q \
   tests/ut/expert_offload/test_global_store.py \
+  tests/ut/expert_offload/test_staging_pipeline.py \
   tests/ut/expert_offload/test_global_store_integration.py \
   tests/ut/expert_offload/test_multi_card_planner.py \
   tests/ut/expert_offload/test_h2d_transfer.py
@@ -290,3 +368,41 @@ caused by removed `enable_sp`/`AscendDeviceType` mock targets; the same failures
 are reproduced with the pre-change forward-context source loaded in memory.
 This validation does not cover DeepSeek FP4 kernels, attention/KV graph
 updates, DSpark proposal generation or full-model serving.
+
+## Ping-pong staging validation (2026-11-25)
+
+The earlier bring-up results above predate expert-count budgeting and retain
+those runs' original staging sizes. The new default is four experts per rank.
+
+The selected CPU regressions pass 117 cases, including delayed-DMA overwrite
+checks, bank reuse across calls, failure cleanup, odd budgets, physical storage
+padding and RDMA destination offsets. Three single-NPU stress cases pass with
+budgets 2/3/4, raw weights, strided quant fields and dtype conversion. The RDMA
+adapter compiles with `-Wall -Wextra -Werror`; real RDMA hardware is untested.
+
+A 20-iteration single-NPU microbenchmark with six 12.75 MiB experts per batch
+and 51 MiB staging measures 6.80 ms median for the previous implementation
+and 5.80 ms for ping-pong staging. Full stream synchronizations drop from 25
+to one per batch; bank completion events still protect reuse. This measures
+materialization only and is not a full-model throughput result. Reproduce on
+an idle NPU after sourcing the container's CANN environment:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 PYTHONPATH=$PWD \
+  /data/l00955465/multi-card/.venv-dp4-ep4/bin/python \
+  benchmarks/expert_offload/benchmark_staging_pipeline.py \
+  --baseline-source /path/to/previous/global_store/staging.py
+```
+
+The two-NPU cross-owner FULL replay test passes after fixing its report
+subscription lifecycle. The production TP2/EP2 FULL test also passes: 13
+forwards, two captured graphs, 11 graph callbacks per rank, changing routes,
+zero valid rows, eager ALLTOALL fallback and graph reuse. Every rank matches
+an independent CPU reference, with maximum absolute error below 2.05e-4.
+Initial failures were in callback report teardown; test fixtures now stop
+report processing before captured graph callback owners are destroyed.
+These synthetic tests do not cover DeepSeek FP4 grouped matmul or real serving.
+Logs and the microbenchmark JSON are retained in
+`/data/l00955465/multi-card/runtime/staging_validation`.
+The full formatting hook could not initialize its Ruff environment because
+the configured GitHub proxy returned HTTP 407.

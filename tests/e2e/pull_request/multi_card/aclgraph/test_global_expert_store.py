@@ -53,6 +53,7 @@ def _worker(rank, port, runtime_dir):
     executor = TransferExecutor(rank, 30)
     load_stream = torch.npu.Stream()
     compute_stream = torch.npu.Stream()
+    torch_npu.npu._subscribe_report(compute_stream)
     ids = torch.zeros(1, dtype=torch.int32, device="npu")
     ids_h = torch.zeros(1, dtype=torch.int32, pin_memory=True)
     destination = torch.zeros(size, dtype=torch.uint8, device="npu")
@@ -95,6 +96,8 @@ def _worker(rank, port, runtime_dir):
         assert output.cpu().item() == size * (expert + 1)
         assert torch.equal(destination.cpu(), torch.full((size,), expert + 1, dtype=torch.uint8))
     torch.npu.synchronize()
+    # Stop the callback report thread before destroying its captured graph.
+    torch_npu.npu._unsubscribe_report(compute_stream)
     del graph, output
     gc.collect()
     executor.close()

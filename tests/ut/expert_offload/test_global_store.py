@@ -26,7 +26,7 @@ def config(path, protocol="disabled"):
         "expert_offload": True, "enable_multi_card": True,
         "host_storage": {"mode": "global_sharded", "runtime_dir": str(path)},
         "transport": {"inter_node": protocol, "bind_address": "127.0.0.1",
-                      "advertise_address": "127.0.0.1", "staging_buffer_mb": 1,
+                      "advertise_address": "127.0.0.1", "staging_buffer_experts": 4,
                       "timeout_s": 5},
         "graph": {"mc2_decode": True},
     })
@@ -46,7 +46,7 @@ def test_config_is_opt_in_and_strict(tmp_path):
                            ("placement", {"scope": "node"}),
                            ("graph", {"mc2_decode": 1}),
                            ("host_storage", {"mode": "global_sharded", "runtime_dir": "relative"}),
-                           ("transport", {"staging_buffer_mb": 0}),
+                           ("transport", {"staging_buffer_experts": 0}),
                            ("transport", {"typo": 1})]:
         with pytest.raises((TypeError, ValueError)):
             GlobalStoreConfig.parse({section: value})
@@ -196,10 +196,23 @@ def test_two_process_single_copy_and_cross_owner_read(tmp_path, protocol, force_
 
 
 def test_staging_chunks_weights_and_copies_strided_quant_values(tmp_path):
-    staging = torch.empty(32, dtype=torch.uint8)
+    staging = torch.empty(128, dtype=torch.uint8)
+
+    class Event:
+        def record(self, stream):
+            pass
+
+        def query(self):
+            return True
+
+        def synchronize(self):
+            pass
 
     class Delegate:
         def synchronize(self, stream):
+            pass
+
+        def close(self):
             pass
 
     key = ExpertKey("model", "target", "layer.0", 0)
@@ -214,23 +227,23 @@ def test_staging_chunks_weights_and_copies_strided_quant_values(tmp_path):
     weight = torch.zeros(128, dtype=torch.uint8)
     task = SimpleNamespace(source=directory.source(key, "w13"), destination=weight.untyped_storage(),
                            nbytes=128, name="w13")
-    with patch.object(torch, "npu", SimpleNamespace(current_stream=lambda: None), create=True):
-        transport.copy_batch([task])
-    assert torch.equal(weight, fields(0)["w13"])
-    # A field larger than staging is rejected before any quant copy.
-    task = SimpleNamespace(source=directory.source(key, "w13_weight_scale"),
-                           destination=torch.empty(3, 4), nbytes=48, name="scale")
-    with pytest.raises(ValueError, match="Quant field"):
-        transport.copy_batch([task])
-    transport.staging = torch.empty(64, dtype=torch.uint8)
-    transport.view.release()
-    transport.__init__(Store(), transport.staging, Delegate())
-    expected = fields(0)["w13_weight_scale"]
-    destination = torch.empty(3, 4).t()
-    task = SimpleNamespace(source=directory.source(key, "w13_weight_scale"),
-                           destination=destination, nbytes=48, name="scale")
-    with patch.object(torch, "npu", SimpleNamespace(current_stream=lambda: None), create=True):
-        transport.copy_batch([task])
-    assert torch.equal(destination, expected)
-    transport.view.release()
-    region.close()
+    npu = SimpleNamespace(current_stream=lambda: None, Event=Event)
+    try:
+        with patch.object(torch, "npu", npu, create=True):
+            transport.copy_batch([task])
+            assert torch.equal(weight, fields(0)["w13"])
+            # Logical quant copies must fit one bank without splitting a view.
+            with pytest.raises(ValueError, match="Quant field"):
+                transport.copy_batch([SimpleNamespace(source=directory.source(key, "w13"),
+                                                      destination=torch.empty(128),
+                                                      nbytes=128, name="oversized_quant")])
+            expected = fields(0)["w13_weight_scale"]
+            destination = torch.empty(3, 4).t()
+            task = SimpleNamespace(source=directory.source(key, "w13_weight_scale"),
+                                   destination=destination, nbytes=48, name="scale")
+            transport.copy_batch([task])
+            transport.synchronize(None)
+            assert torch.equal(destination, expected)
+    finally:
+        transport.close()
+        region.close()

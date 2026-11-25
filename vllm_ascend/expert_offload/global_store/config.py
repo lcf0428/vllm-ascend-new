@@ -29,9 +29,13 @@ class GlobalStoreConfig:
             "startup_timeout_s": 600,
             "backing": "memfd",
         }, "host_storage")
+        if "staging_buffer_mb" in (values.get("transport") or {}):
+            raise ValueError("staging_buffer_mb was replaced by staging_buffer_experts "
+                             "(total expert capacity across two banks per rank; minimum 2)")
         transport = _section(values.get("transport"), {
             "intra_node": "shared_memory", "inter_node": "disabled",
-            "staging_buffer_mb": 64, "timeout_s": 60,
+            "control_backend": "gloo",
+            "staging_buffer_experts": 4, "timeout_s": 60,
             "bind_address": "0.0.0.0", "advertise_address": None,
             "rdma_library": None,
             "rdma_device": "", "rdma_port": 1, "rdma_gid_index": 0,
@@ -50,11 +54,15 @@ class GlobalStoreConfig:
             raise ValueError("Version 1 requires intra_node=shared_memory")
         if transport["inter_node"] not in ("disabled", "tcp", "rdma"):
             raise ValueError("transport.inter_node must be disabled, tcp or rdma")
+        if transport["control_backend"] not in ("gloo", "shared_memory"):
+            raise ValueError("transport.control_backend must be gloo or shared_memory")
+        if transport["control_backend"] == "shared_memory" and host["mode"] != "global_sharded":
+            raise ValueError("shared_memory control requires host_storage.mode=global_sharded")
         if placement != {"scope": "ep_group", "policy": "stable"}:
             raise ValueError("Version 1 requires stable placement within the EP group")
         if type(graph["mc2_decode"]) is not bool:
             raise TypeError("graph.mc2_decode must be boolean")
-        for name, value in (("staging_buffer_mb", transport["staging_buffer_mb"]),
+        for name, value in (("staging_buffer_experts", transport["staging_buffer_experts"]),
                             ("timeout_s", transport["timeout_s"]),
                             ("startup_timeout_s", host["startup_timeout_s"])):
             if type(value) is not int or value <= 0:
@@ -63,8 +71,8 @@ class GlobalStoreConfig:
             raise ValueError("rdma_port must be positive")
         if type(transport["rdma_gid_index"]) is not int or transport["rdma_gid_index"] < 0:
             raise ValueError("rdma_gid_index must be nonnegative")
-        if transport["staging_buffer_mb"] >= 4096:
-            raise ValueError("staging_buffer_mb must be below 4096 (RDMA chunk size is uint32)")
+        if transport["staging_buffer_experts"] < 2:
+            raise ValueError("staging_buffer_experts must be >= 2 (two banks total)")
         if host["mode"] == "global_sharded":
             if not host["runtime_dir"] or not Path(host["runtime_dir"]).is_absolute():
                 raise ValueError("global_sharded requires an absolute host_storage.runtime_dir")

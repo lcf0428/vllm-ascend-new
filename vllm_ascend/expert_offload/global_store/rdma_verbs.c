@@ -126,10 +126,11 @@ static double monotonic_seconds(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-int expert_rdma_read(struct connection *c, const struct endpoint *peer,
-                     uint64_t offset, uint32_t size, double timeout) {
-    if (!size || size > c->mr->length || offset > peer->size || size > peer->size - offset) return -1;
-    struct ibv_sge sge = {(uintptr_t)c->mr->addr, size, c->mr->lkey};
+int expert_rdma_read_into(struct connection *c, const struct endpoint *peer,
+                          uint64_t offset, uint64_t local_offset, uint32_t size, double timeout) {
+    if (!size || local_offset > c->mr->length || size > c->mr->length - local_offset ||
+        offset > peer->size || size > peer->size - offset) return -1;
+    struct ibv_sge sge = {(uintptr_t)c->mr->addr + local_offset, size, c->mr->lkey};
     struct ibv_send_wr wr = {0}, *bad = NULL;
     wr.wr_id = 1;
     wr.sg_list = &sge;
@@ -152,4 +153,10 @@ int expert_rdma_read(struct connection *c, const struct endpoint *peer,
         }
         usleep(50);
     }
+}
+
+/* Preserve the legacy entry point for existing zero-offset clients. */
+int expert_rdma_read(struct connection *c, const struct endpoint *peer,
+                     uint64_t offset, uint32_t size, double timeout) {
+    return expert_rdma_read_into(c, peer, offset, 0, size, timeout);
 }

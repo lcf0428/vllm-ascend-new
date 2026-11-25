@@ -119,6 +119,8 @@ class ExpertOffloadManager:
         self._exclusive_pool = None
         self._global_store = None
         self._global_executor = None
+        self._cross_rank_control = None
+        self._control_watchdog = None
         self._global_model_id = str(vllm_config.model_config.model)
         if getattr(self.offload_config, "global_store_enabled", False):
             parallel = vllm_config.parallel_config
@@ -3403,8 +3405,11 @@ class ExpertOffloadManager:
         return gathered
 
     def _initialize_global_store(self):
+        from vllm_ascend.expert_offload.global_store.control import CallbackWatchdog, SharedMemoryControl
         from vllm_ascend.expert_offload.global_store.executor import TransferExecutor
-        from vllm_ascend.expert_offload.global_store.staging import StagingTransport
+        from vllm_ascend.expert_offload.global_store.staging import (
+            MAX_RDMA_READ_BYTES, StagingTransport, staging_buffer_sizes,
+        )
         from vllm_ascend.expert_offload.global_store.store import GlobalExpertStore
         from vllm_ascend.expert_offload.global_store.types import ExpertKey
 
@@ -3425,8 +3430,11 @@ class ExpertOffloadManager:
                         if layer_idx < len(values) and local < len(values[layer_idx]):
                             fields[attr] = values[layer_idx][local]
                 experts.append((ExpertKey(self._global_model_id, "target", name, eid), fields))
-        staging = torch.empty(config.transport["staging_buffer_mb"] * (1 << 20),
-                              dtype=torch.uint8, device="cpu", pin_memory=True)
+        bank_sizes = staging_buffer_sizes(experts, config.transport["staging_buffer_experts"])
+        if config.transport["inter_node"] == "rdma" and max(bank_sizes) > MAX_RDMA_READ_BYTES:
+            raise ValueError("Each staging bank must be below 4 GiB for uint32 RDMA reads; "
+                             "reduce staging_buffer_experts")
+        staging = torch.empty(sum(bank_sizes), dtype=torch.uint8, device="cpu", pin_memory=True)
         store = GlobalExpertStore(config, self.ep_rank, self.ep_size, self._global_all_gather,
                                   self._global_model_id, layers, experts, staging)
         # Preserve metadata expected by pool allocation, but point every owner
@@ -3451,11 +3459,17 @@ class ExpertOffloadManager:
         # or other process's allocator is affected by this call.
         torch_npu.npu.host_empty_cache()
         self._global_store = store
-        self.h2d_transport = StagingTransport(store, staging, self._get_h2d_transport())
+        self._cross_rank_control = SharedMemoryControl.bootstrap(store, self.num_total_experts, self._global_all_gather)
+        if self._cross_rank_control is not None:
+            self._control_watchdog = CallbackWatchdog(config.transport["timeout_s"], self._control_timeout_exit)
+            logger.info("[GLOBAL-EXPERT-STORE] control_backend=shared_memory EP=%d bytes=%d job=%s",
+                        self.ep_size, self._cross_rank_control.size, store.job_dir)
+        self.h2d_transport = StagingTransport(store, staging, self._get_h2d_transport(), bank_sizes)
         self._global_executor = TransferExecutor(self.load_stream.device, config.transport["timeout_s"])
-        logger.info("[GLOBAL-EXPERT-STORE] READY: EP=%d canonical_bytes=%d staging_bytes_per_rank=%d job=%s",
+        logger.info("[GLOBAL-EXPERT-STORE] READY: EP=%d canonical_bytes=%d staging_bytes_per_rank=%d "
+                    "staging_buffer_experts=%d staging_bank_bytes=%s job=%s",
                     self.ep_size, sum(m["size"] for m in store.directory.manifests.values()),
-                    staging.numel(), store.job_dir)
+                    staging.numel(), config.transport["staging_buffer_experts"], bank_sizes, store.job_dir)
 
     def _global_prefill_load(self, layer_idx, pool_slot, base, shard):
         with torch_npu.npu.stream(self.load_stream):
@@ -3745,7 +3759,14 @@ class ExpertOffloadManager:
                                               misses, pending_resident, debug_context)
             except Exception as exc:
                 failure = f"rank={self.ep_rank}: {type(exc).__name__}: {exc}"
-            failures = [f for f in self._global_all_gather(failure) if f]
+            control = getattr(self, "_cross_rank_control", None)
+            if control is not None and debug_context is not None:
+                self._log_mc_debug_event("SHM_READY_ENTER", debug_context, sequence=control.sequence + 1)
+            failures = (control.ready(layer_idx, failure) if control is not None
+                        else [f for f in self._global_all_gather(failure) if f])
+            if control is not None and debug_context is not None:
+                self._log_mc_debug_event("SHM_READY_EXIT", debug_context, sequence=control.sequence,
+                                         failed=bool(failures))
             if failures:
                 raise RuntimeError("Expert materialization failed: " + "; ".join(failures))
             resident_map.clear()
@@ -3896,8 +3917,24 @@ class ExpertOffloadManager:
         from vllm_ascend.expert_offload.multi_card_planner import local_expert_counts_cpu
 
         local_counts = local_expert_counts_cpu(topk_ids_h, self.num_total_experts)
-        global_counts = self._gather_cpu_with_mc_debug(local_counts, cpu_group, "count", debug_context)
         cache_on = self.offload_config.cache_policy_enabled
+        control = getattr(self, "_cross_rank_control", None)
+        shared_score_sum = None
+        if control is None:
+            global_counts = self._gather_cpu_with_mc_debug(local_counts, cpu_group, "count", debug_context)
+        else:
+            local_score_sum = None
+            if cache_on and (self._mc_lrc is not None or self.cache_policy is not None) and topk_weights_h is not None:
+                ids = topk_ids_h.reshape(-1).to(torch.int64)
+                scores = topk_weights_h.reshape(-1).to(torch.float32)
+                local_score_sum = torch.zeros(self.num_total_experts, dtype=torch.float32)
+                local_score_sum.scatter_add_(0, ids, scores)
+            # Counts and optional router sums share one publication/acknowledgement.
+            if debug_context is not None:
+                self._log_mc_debug_event("SHM_STATS_ENTER", debug_context, sequence=control.sequence + 1)
+            global_counts, shared_score_sum = control.statistics(layer_idx, local_counts, local_score_sum)
+            if debug_context is not None:
+                self._log_mc_debug_event("SHM_STATS_EXIT", debug_context, sequence=control.sequence)
         if not cache_on:
             return global_counts, cache_on, None, None
         # Reuse the configured single-card policy so every cache tuning knob
@@ -3912,11 +3949,14 @@ class ExpertOffloadManager:
 
         global_router_score = None
         if topk_weights_h is not None:
-            ids = topk_ids_h.reshape(-1).to(torch.int64)
-            scores = topk_weights_h.reshape(-1).to(torch.float32)
-            local_score_sum = torch.zeros(self.num_total_experts, dtype=torch.float32)
-            local_score_sum.scatter_add_(0, ids, scores)
-            global_score_sum = self._gather_cpu_with_mc_debug(local_score_sum, cpu_group, "router_score", debug_context)
+            if control is not None:
+                global_score_sum = shared_score_sum
+            else:
+                ids = topk_ids_h.reshape(-1).to(torch.int64)
+                scores = topk_weights_h.reshape(-1).to(torch.float32)
+                local_score_sum = torch.zeros(self.num_total_experts, dtype=torch.float32)
+                local_score_sum.scatter_add_(0, ids, scores)
+                global_score_sum = self._gather_cpu_with_mc_debug(local_score_sum, cpu_group, "router_score", debug_context)
             global_router_score = torch.zeros_like(global_score_sum)
             active = global_counts > 0
             global_router_score[active] = global_score_sum[active] / global_counts[active].to(global_score_sum.dtype)
@@ -3989,6 +4029,10 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        watchdog = getattr(self, "_control_watchdog", None)
+        if watchdog is not None:
+            watchdog.close()
+            self._control_watchdog = None
         if getattr(self, "_global_executor", None) is not None:
             self._global_executor.close()
             self._global_executor = None
@@ -4023,6 +4067,10 @@ class ExpertOffloadManager:
             self.scale_cpu_buffers.clear()
             self.offset_cpu_buffers.clear()
             self.scale_bias_cpu_buffers.clear()
+            control = getattr(self, "_cross_rank_control", None)
+            if control is not None:
+                control.close()
+                self._cross_rank_control = None
             self._global_store.close()
             self._global_store = None
 
@@ -4352,6 +4400,10 @@ class ExpertOffloadManager:
         logger.error("[GLOBAL-EXPERT-STORE] timed out; terminating worker with transfer memory retained")
         os._exit(1)
 
+    def _control_timeout_exit(self):
+        self._cross_rank_control.abort("Expert callback exceeded its deadline")
+        self._global_timeout_exit()
+
     def _update_weights_multi_card_graph_guarded(self, args):
         try:
             self._update_weights_multi_card_guarded(args)
@@ -4367,18 +4419,26 @@ class ExpertOffloadManager:
         loud. It is a hard configuration error, not a recoverable condition.
         """
         timer = None
-        if getattr(self, "_global_store", None) is not None:
+        watchdog = getattr(self, "_control_watchdog", None)
+        if watchdog is not None:
+            watchdog.arm()
+        elif getattr(self, "_global_store", None) is not None:
             timer = threading.Timer(self.offload_config.global_store_config.transport["timeout_s"],
                                     self._global_timeout_exit)
             timer.daemon = True
             timer.start()
         try:
             self._update_weights_multi_card(args)
-        except BaseException:
+        except BaseException as exc:
             if getattr(self, "_global_store", None) is not None:
+                control = getattr(self, "_cross_rank_control", None)
+                if control is not None:
+                    control.abort(f"Expert callback failed: {type(exc).__name__}: {exc}")
                 raise
             self._note_cb_failure("update_weights_multi_card")
         finally:
+            if watchdog is not None:
+                watchdog.disarm()
             if timer is not None:
                 timer.cancel()
 

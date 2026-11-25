@@ -32,7 +32,7 @@ def _expert(x, w13, w2, scale13, scale2):
     return (torch.nn.functional.silu(gate) * up).to(w2.dtype).matmul(w2).float() * scale2
 
 
-def _worker(rank, port, directory, full_graph=False, world_size=4):
+def _worker(rank, port, directory, full_graph=False, world_size=4, control_backend="gloo"):
     # Lazy worker imports keep NPU initialization out of the spawning process.
     import torch_npu  # noqa: F401
     from vllm.config import CUDAGraphMode, set_current_vllm_config
@@ -50,7 +50,9 @@ def _worker(rank, port, directory, full_graph=False, world_size=4):
     from vllm_ascend.distributed.parallel_state import (
         destroy_ascend_model_parallel, init_ascend_model_parallel,
     )
-    from vllm_ascend.expert_offload.expert_offload_manager import ExpertOffloadManager
+    from vllm_ascend.expert_offload.expert_offload_manager import (
+        ExpertOffloadManager, get_subscribed_compute_streams,
+    )
     from vllm_ascend.expert_offload.routed_experts import apply_offloaded_experts
     from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
     from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
@@ -65,7 +67,7 @@ def _worker(rank, port, directory, full_graph=False, world_size=4):
         "h2d_backend": "torch", "num_device_experts": [slots], "num_device_layers": 1,
         "cache_policy_enabled": True,
         "host_storage": {"mode": "global_sharded", "runtime_dir": str(Path(directory) / "store")},
-        "transport": {"staging_buffer_mb": 1, "timeout_s": 60},
+        "transport": {"staging_buffer_experts": 4, "timeout_s": 60, "control_backend": control_backend},
         "graph": {"mc2_decode": full_graph},
     }
     cfg = EngineArgs(model=directory, tensor_parallel_size=world_size, enable_expert_parallel=True,
@@ -116,6 +118,13 @@ def _worker(rank, port, directory, full_graph=False, world_size=4):
         layer.w13_weight = layer.w13_weight.transpose(1, 2).contiguous()
         layer.w2_weight = layer.w2_weight.transpose(1, 2).contiguous()
         manager._finalize_offload(None)
+        if control_backend == "shared_memory":
+            assert manager._cross_rank_control is not None
+            # After bootstrap, per-layer statistics/READY must never use Gloo.
+            def forbidden_gather(*args, **kwargs):
+                raise AssertionError("Per-layer control unexpectedly entered Gloo")
+            manager._global_all_gather = forbidden_gather
+            manager._gather_cpu_with_mc_debug = forbidden_gather
         remote_reads = [0]
         read_into = manager._global_store.read_into
 
@@ -272,6 +281,13 @@ def _worker(rank, port, directory, full_graph=False, world_size=4):
         remote_counts = torch.tensor([remote_reads[0]])
         dist.all_reduce(remote_counts, group=get_ep_group().cpu_group)
         assert remote_counts.item() > 0
+        torch.npu.synchronize()
+        # The installed torch_npu unsubscribe helper stops its process-wide
+        # report thread. Call it once before destroying captured graph owners.
+        subscribed = get_subscribed_compute_streams()
+        if subscribed:
+            torch_npu.npu._unsubscribe_report(next(iter(subscribed)))
+        subscribed.clear()
         manager.close()
         torch.npu.synchronize()
         destroy_ascend_model_parallel()
@@ -279,7 +295,7 @@ def _worker(rank, port, directory, full_graph=False, world_size=4):
         destroy_distributed_environment()
 
 
-def _run(full_graph=False, world_size=4):
+def _run(full_graph=False, world_size=4, control_backend="gloo"):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -293,7 +309,8 @@ def _run(full_graph=False, world_size=4):
             "torch_dtype": "bfloat16",
         }
         (Path(directory) / "config.json").write_text(json.dumps(config))
-        mp.spawn(_worker, args=(port, directory, full_graph, world_size), nprocs=world_size, join=True)
+        mp.spawn(_worker, args=(port, directory, full_graph, world_size, control_backend),
+                 nprocs=world_size, join=True)
 
 
 
@@ -308,3 +325,7 @@ def test_global_store_tp4_ep4_full_decode_graph():
 
 def test_global_store_tp2_ep2_full_decode_graph():
     _run(full_graph=True, world_size=2)
+
+
+def test_global_store_tp2_ep2_full_shared_control():
+    _run(full_graph=True, world_size=2, control_backend="shared_memory")
