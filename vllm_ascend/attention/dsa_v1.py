@@ -361,6 +361,7 @@ class AscendDSAReqMetadata:
     ori_win_left: int | None = None
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
+    dspark_swa_lengths: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
 
 
@@ -430,6 +431,7 @@ def build_dspark_swa_indices(
     buffer: torch.Tensor | None = None,
     *,
     use_logical_indices: bool = False,
+    lengths_buffer: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build DSpark non-causal visible slot ids for a paged SWA cache.
 
@@ -443,6 +445,8 @@ def build_dspark_swa_indices(
     rows and the returned tensor is a slice view of ``buffer``. This keeps the
     address stable across async ACL-graph replays, where the DSA operator
     captures ``ori_sparse_indices``'s data pointer at capture time.
+    ``lengths_buffer`` similarly holds persistent int32 [T, 1] top-k lengths.
+    Unused buffer rows are cleared so a smaller replay cannot reuse stale data.
     """
     if index_width is None:
         index_width = _aligned_dspark_index_width(window_size, num_speculative_tokens)
@@ -498,7 +502,16 @@ def build_dspark_swa_indices(
             f"dspark_swa_indices needs {num_rows} rows but `buffer` only has {buffer.shape[0]}"
         )
         buffer[:num_rows].copy_(per_token_slots)
+        buffer[num_rows:].fill_(-1)
         per_token_slots = buffer[:num_rows]
+
+    if lengths_buffer is not None:
+        num_rows = per_token_lens.shape[0]
+        if lengths_buffer.ndim != 2 or lengths_buffer.shape[1] != 1 or num_rows > lengths_buffer.shape[0]:
+            raise ValueError("DSpark SWA lengths buffer must have shape [capacity, 1] and cover all query rows")
+        lengths_buffer[:num_rows, 0].copy_(per_token_lens)
+        lengths_buffer[num_rows:].zero_()
+        per_token_lens = lengths_buffer[:num_rows, 0]
 
     return per_token_slots, per_token_lens
 
@@ -617,6 +630,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.decode_threshold = 1
         self.spec_slot_mapping = None
         self.dspark_swa_indices_buffer: torch.Tensor | None = None
+        self.dspark_swa_lengths_buffer: torch.Tensor | None = None
         kv_plan = get_dsa_attn_kv_plan(vllm_config)
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.slot_mapping_shape = (
@@ -650,6 +664,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 dtype=torch.int32,
                 device=self.device,
             )
+            self.dspark_swa_lengths_buffer = torch.zeros((max_dspark_rows, 1), dtype=torch.int32, device=self.device)
             self.decode_threshold += spec_token_num
             assert self.decode_threshold <= 16, (
                 f"decode_threshold exceeded \
@@ -918,7 +933,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_seqlen_kv: int | torch.Tensor,
         cu_seqlens_ori_kv: torch.Tensor | None,
         cu_seqlens_cmp_kv: torch.Tensor | None,
+        dspark_swa_indices: torch.Tensor | None = None,
+        dspark_swa_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Sparse non-causal SWA has a different tiling contract from dense SWA.
+        sparse_dspark = dspark_swa_lengths is not None and self.compressor_ratio <= 1
+        if sparse_dspark:
+            layer_name = f"{layer_name}:dspark"
         sas_metadata = metadata_cache.get(layer_name)
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
@@ -934,6 +955,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
             metadata_op = kv_plan.get_dsa_sparse_attn_metadata_op()
             metadata_kwargs = kv_plan.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+            if sparse_dspark:
+                assert dspark_swa_indices is not None
+                metadata_kwargs.update(ori_topk=dspark_swa_indices.shape[-1], ori_topk_length=dspark_swa_lengths)
             sas_metadata = metadata_op(
                 **metadata_kwargs,
                 num_heads_q=n_local_heads,
@@ -949,10 +973,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 batch_size=len(seq_lens),
                 cmp_topk=index_topk if self.compressor_ratio == 4 else 0,
                 cmp_ratio=cmp_ratio,
-                ori_mask_mode=4,  # 4:sliding window
-                cmp_mask_mode=3,  # 3:causal
-                ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                ori_win_right=0,
+                ori_mask_mode=0 if sparse_dspark else 4,  # Explicit indices already encode the visible window.
+                cmp_mask_mode=0 if sparse_dspark else 3,
+                ori_win_left=-1 if sparse_dspark else self.model_config.hf_config.sliding_window - 1,
+                ori_win_right=-1 if sparse_dspark else 0,
                 layout_q="TND",
                 layout_kv=_dsa_layout_kv(self.vllm_config),
                 has_ori_kv=True,
@@ -1034,6 +1058,46 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             dtype=torch.int32,
             device=self.device,
         )
+        self.dspark_swa_lengths_buffer = torch.empty((max_num_tokens, 1), dtype=torch.int32, device=self.device)
+
+    def _prepare_dspark_swa_metadata(
+        self,
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Callable[[], None]]:
+        assert self.speculative_config is not None
+        indices_buffer = self.dspark_swa_indices_buffer
+        lengths_buffer = self.dspark_swa_lengths_buffer
+        if indices_buffer is None or lengths_buffer is None:
+            raise RuntimeError(
+                "DSpark device metadata buffers must be initialized before building draft attention metadata"
+            )
+        if num_tokens > indices_buffer.shape[0]:
+            raise ValueError(
+                "DSpark SWA metadata rows exceed the persistent buffer capacity: "
+                f"active={num_tokens}, capacity={indices_buffer.shape[0]}"
+            )
+        use_logical_indices = get_dsa_attn_kv_plan(self.vllm_config).uses_sparse_flash_mla
+        indices = indices_buffer[:num_tokens]
+        lengths = lengths_buffer[:num_tokens] if use_logical_indices else None
+
+        def build_swa() -> None:
+            build_dspark_swa_indices(
+                block_table,
+                self.speculative_config.num_speculative_tokens,
+                self.model_config.hf_config.sliding_window,
+                self.storage_block_size,
+                query_start_loc,
+                seq_lens,
+                num_tokens,
+                buffer=indices_buffer,
+                use_logical_indices=use_logical_indices,
+                lengths_buffer=lengths_buffer if use_logical_indices else None,
+            )
+
+        return indices, lengths, build_swa
 
     def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
         tasks = self._device_metadata_tasks
@@ -1103,6 +1167,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_ori_kv = None
         cu_seqlens_cmp_kv = None
         dspark_swa_indices = None
+        dspark_swa_lengths = None
+        build_dspark_swa = None
         vision_swa_indices = None
         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
         if not has_prefill and not common_attn_metadata.causal:
@@ -1111,18 +1177,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             # Not gated on the SAS metadata cache: the indices depend on the
             # current step's block table / sequence lengths, so they must be
             # rebuilt whenever a DSpark draft step runs.
-            assert self.speculative_config is not None
-            dspark_swa_indices, _ = build_dspark_swa_indices(
+            dspark_swa_indices, dspark_swa_lengths, build_dspark_swa = self._prepare_dspark_swa_metadata(
                 self.block_table[: self.num_decodes],
-                self.speculative_config.num_speculative_tokens,
-                self.model_config.hf_config.sliding_window,
-                self.storage_block_size,
                 query_start_loc[: self.num_decodes + 1],
                 self.seq_lens[: self.num_decodes],
                 self.num_decode_tokens,
-                buffer=self.dspark_swa_indices_buffer,
             )
-            ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
+            if not self._device_metadata_enabled:
+                build_dspark_swa()
+                build_dspark_swa = None
+            ori_win_left, ori_win_right = (
+                (-1, -1) if dspark_swa_lengths is not None else get_dspark_sparse_sas_window(self.vllm_config)
+            )
         # Text-only requests and lightweight metadata fixtures do not carry
         # multimodal document ranges. Treat those as having no vision spans.
         mm_ranges = getattr(common_attn_metadata, "mm_req_doc_ranges", None)
@@ -1168,6 +1234,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         if self._device_metadata_enabled:
 
             def build_sas_metadata() -> None:
+                if build_dspark_swa is not None:
+                    build_dspark_swa()
                 self._build_sas_metadata(
                     metadata_cache=metadata_cache,
                     layer_name=layer_name,
@@ -1177,6 +1245,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     max_seqlen_kv=max_seqlen_kv,
                     cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                     cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                    dspark_swa_indices=dspark_swa_indices,
+                    dspark_swa_lengths=dspark_swa_lengths,
                 )
 
             def build_qli_metadata() -> None:
@@ -1210,6 +1280,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_kv=max_seqlen_kv,
                 cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                dspark_swa_indices=dspark_swa_indices,
+                dspark_swa_lengths=dspark_swa_lengths,
             )
             qli_metadata = self._build_qli_metadata(
                 metadata_cache=metadata_cache,
@@ -1268,6 +1340,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
+            dspark_swa_lengths=dspark_swa_lengths,
             vision_swa_indices=vision_swa_indices,
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
@@ -1369,39 +1442,21 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         has_prefill = self.num_prefills > 0
 
         dspark_swa_indices = None
+        dspark_swa_lengths = None
         build_dspark_swa = None
+        kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
         ori_win_left = self.model_config.hf_config.sliding_window - 1
         ori_win_right = 0
         if not common_attn_metadata.causal:
-            assert self.speculative_config is not None
-            dspark_swa_args = (
-                self.block_table[:num_reqs],
-                self.speculative_config.num_speculative_tokens,
-                self.model_config.hf_config.sliding_window,
-                self.storage_block_size,
-                query_start_loc,
-                seq_lens,
-                self.num_actual_tokens,
+            dspark_swa_indices, dspark_swa_lengths, build_dspark_swa = self._prepare_dspark_swa_metadata(
+                self.block_table[:num_reqs], query_start_loc, seq_lens, self.num_actual_tokens
             )
-            if self._device_metadata_enabled and not has_prefill:
-                if self.dspark_swa_indices_buffer is None:
-                    raise RuntimeError(
-                        "DSpark device metadata buffers must be initialized before building draft attention metadata"
-                    )
-                if self.num_actual_tokens > self.dspark_swa_indices_buffer.shape[0]:
-                    raise ValueError(
-                        "DSpark SWA metadata rows exceed the persistent buffer capacity: "
-                        f"active={self.num_actual_tokens}, capacity={self.dspark_swa_indices_buffer.shape[0]}"
-                    )
-                dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
-                build_dspark_swa = lambda: build_dspark_swa_indices(
-                    *dspark_swa_args,
-                    indices_output=dspark_swa_indices,
-                )
-            else:
-                dspark_swa_indices, _ = build_dspark_swa_indices(*dspark_swa_args)
-                dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
-            ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
+            if not self._device_metadata_enabled or has_prefill:
+                build_dspark_swa()
+                build_dspark_swa = None
+            ori_win_left, ori_win_right = (
+                (-1, -1) if dspark_swa_lengths is not None else get_dspark_sparse_sas_window(self.vllm_config)
+            )
 
         cu_seqlens_ori_kv = (
             query_start_loc
@@ -1418,11 +1473,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_cmp_kv = (
             None if has_prefill else DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
         )
-        kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
         metadata_op = kv_plan.get_dsa_sparse_attn_metadata_op()
         metadata_kwargs = kv_plan.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
+
+        if dspark_swa_lengths is not None:
+            metadata_kwargs.update(ori_topk=dspark_swa_indices.shape[-1], ori_topk_length=dspark_swa_lengths)
 
         def build_attention_metadata() -> torch.Tensor:
             if build_dspark_swa is not None:
@@ -1441,8 +1498,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=num_reqs,
                 cmp_ratio=1,
-                ori_mask_mode=4,
-                cmp_mask_mode=3,
+                ori_mask_mode=0 if dspark_swa_lengths is not None else 4,
+                cmp_mask_mode=0 if dspark_swa_lengths is not None else 3,
                 ori_win_left=ori_win_left,
                 ori_win_right=ori_win_right,
                 layout_q="TND",
@@ -1492,6 +1549,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
+            dspark_swa_lengths=dspark_swa_lengths,
         )
 
     def build_for_graph_capture(
@@ -2268,6 +2326,16 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if self.compress_ratio <= 1:
             if swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
+                if kv_plan.uses_sparse_flash_mla:
+                    assert swa_req_metadata.dspark_swa_lengths is not None
+                    attn_kwargs.update(
+                        ori_topk_length=swa_req_metadata.dspark_swa_lengths,
+                        ori_mask_mode=0,
+                        cmp_mask_mode=0,
+                        ori_win_left=-1,
+                        ori_win_right=-1,
+                        topk_value_mode=1,
+                    )
         else:
             assert compressor_metadata is not None
             attn_kwargs.update(

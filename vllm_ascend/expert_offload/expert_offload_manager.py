@@ -4024,7 +4024,13 @@ class ExpertOffloadManager:
         return self.h2d_transport
 
     def _allocate_expert_host_tensor(self, shape, dtype) -> torch.Tensor:
-        """Allocate weight/quant storage owned by the selected H2D backend."""
+        """Allocate temporary owner storage or backend-owned H2D storage."""
+        offload_config = getattr(self, "offload_config", None)
+        if getattr(offload_config, "global_store_enabled", False):
+            # These owner shards are converted and copied into the canonical
+            # store before H2D use. Keep them pageable instead of exhausting
+            # the driver's pinned pool; runtime staging remains pinned.
+            return torch.empty(shape, dtype=dtype, device="cpu")
         return self._get_h2d_transport().allocate_host_tensor(shape, dtype)
 
     def _synchronize_h2d(self, stream=None) -> None:

@@ -45,6 +45,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAMetadataBuilder,
     AscendDSAReqMetadata,
     build_compressor_metadata_out,
+    build_dspark_swa_indices,
     build_vision_bidirectional_swa_indices,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -125,6 +126,8 @@ def test_build_vision_bidirectional_swa_indices_rejects_oversized_span():
 def _mock_dsa_kv_plan(**method_returns) -> MagicMock:
     plan = MagicMock()
     plan.layout_kv = "PA_ND"
+    plan.uses_sparse_flash_mla = False
+    plan.view_quant_cache.side_effect = lambda cache: cache
     for name, value in method_returns.items():
         getattr(plan, name).return_value = value
     return plan
@@ -162,7 +165,9 @@ def _make_vllm_config(num_speculative_tokens: int | None = None) -> SimpleNamesp
             max_num_seqs=4,
         ),
         speculative_config=(
-            None if num_speculative_tokens is None else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(method="dspark", num_speculative_tokens=num_speculative_tokens)
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
         parallel_config=SimpleNamespace(tensor_parallel_size=2),
@@ -193,8 +198,10 @@ def _make_builder(
     num_speculative_tokens: int | None = None,
     *,
     use_tokens_per_state: bool = False,
+    window_size: int = 4096,
 ) -> AscendDSAMetadataBuilder:
     vllm_config = _make_vllm_config(num_speculative_tokens)
+    vllm_config.model_config.hf_config.sliding_window = window_size
     builder = AscendDSAMetadataBuilder(
         kv_cache_spec=_make_kv_cache_spec(compressor_ratio, use_tokens_per_state=use_tokens_per_state),
         layer_names=["model.layers.0.self_attn.attn"],
@@ -278,7 +285,8 @@ def test_num_compressor_metadata_rows(
     assert builder._num_compressor_metadata_rows(num_reqs) == expected_rows
 
 
-def test_draft_swa_and_sas_share_attention_task():
+@pytest.mark.parametrize("uses_sparse_flash_mla", [False, True])
+def test_draft_swa_and_sas_share_attention_task(uses_sparse_flash_mla: bool):
     builder = _make_builder(1, num_speculative_tokens=3)
     builder.enable_dspark_device_metadata(max_num_tokens=16)
     assert builder.dspark_swa_indices_buffer is not None
@@ -289,6 +297,7 @@ def test_draft_swa_and_sas_share_attention_task():
         get_dsa_sparse_attn_metadata_op=metadata_op,
     )
     plan.layout_kv = "PA_BBND"
+    plan.uses_sparse_flash_mla = uses_sparse_flash_mla
 
     with (
         patch.object(
@@ -314,6 +323,11 @@ def test_draft_swa_and_sas_share_attention_task():
         task[0].run()
 
         first_indices = metadata.dspark_swa_indices.clone()
+        if uses_sparse_flash_mla:
+            assert metadata.dspark_swa_lengths.data_ptr() == builder.dspark_swa_lengths_buffer.data_ptr()
+            torch.testing.assert_close(
+                metadata.dspark_swa_lengths[:, 0], torch.tensor([10] * 3 + [14] * 3, dtype=torch.int32)
+            )
         next_metadata = _build_draft_req_metadata(
             builder,
             torch.tensor([12], dtype=torch.int32),
@@ -323,6 +337,11 @@ def test_draft_swa_and_sas_share_attention_task():
         next_task = builder.take_device_metadata_tasks()
         assert next_metadata.dspark_swa_indices.data_ptr() == metadata.dspark_swa_indices.data_ptr()
         next_task[0].run()
+        assert torch.all(builder.dspark_swa_indices_buffer[3:] == -1)
+        if uses_sparse_flash_mla:
+            assert next_metadata.dspark_swa_lengths.data_ptr() == metadata.dspark_swa_lengths.data_ptr()
+            assert torch.all(next_metadata.dspark_swa_lengths == 12)
+            assert torch.count_nonzero(builder.dspark_swa_lengths_buffer[3:]) == 0
 
     assert metadata_op.call_count == 2
     assert not torch.equal(next_metadata.dspark_swa_indices, first_indices[:3])
@@ -952,7 +971,7 @@ def test_build_classifies_short_speculative_extends_as_decodes(
     req_metadata = MagicMock()
     builder.build_req_metadata = MagicMock(return_value=req_metadata)
     builder.build_req_metadata_for_drafting = MagicMock(return_value=req_metadata)
-    builder.spec_slot_mapping = [torch.zeros((16, 2), dtype=torch.int32)]
+    builder.spec_slot_mapping = [torch.zeros_like(builder.slot_mapping)]
     rope_buffer = torch.ones(14)
     shared_metadata: dict[str, Any] = {}
 
@@ -968,7 +987,7 @@ def test_build_classifies_short_speculative_extends_as_decodes(
         patch(
             "vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan",
             return_value=_mock_dsa_kv_plan(
-                format_dsa_slot_mapping=torch.zeros((14, 2), dtype=torch.int32),
+                format_dsa_slot_mapping=torch.zeros_like(builder.slot_mapping[:14]),
             ),
         ),
         patch(
@@ -2325,4 +2344,188 @@ def test_pcp_forward_updates_global_caches_before_local_attention(
         assert torch.equal(
             output[:local_num_actual_tokens],
             attention_output.view(local_num_actual_tokens, 2),
+        )
+
+
+@pytest.mark.parametrize("use_logical_indices", [False, True])
+def test_dspark_swa_indices_noncontiguous_pages_short_and_padding(use_logical_indices: bool):
+    block_table = torch.tensor([[7, 11, 13], [5, 2, 9], [4, 8, 3]], dtype=torch.int32)
+    seq_lens = [263, 5, 0]
+    query_lens = [7, 3, 1]
+    indices, lengths = build_dspark_swa_indices(
+        block_table,
+        num_speculative_tokens=7,
+        window_size=128,
+        block_size=128,
+        query_start_loc=torch.tensor([0, 7, 10, 11], dtype=torch.int32),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        num_decode_tokens=11,
+        use_logical_indices=use_logical_indices,
+    )
+    expected = torch.full((11, 1, 256), -1, dtype=torch.int32)
+    row = 0
+    for req, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
+        start = max(0, seq_len - query_len - 128)
+        positions = list(range(start, seq_len))
+        slots = (
+            positions
+            if use_logical_indices
+            else [int(block_table[req, pos // 128]) * 128 + pos % 128 for pos in positions]
+        )
+        expected[row : row + query_len, 0, : len(slots)] = torch.tensor(slots, dtype=torch.int32)
+        row += query_len
+    torch.testing.assert_close(indices, expected)
+    torch.testing.assert_close(lengths, torch.tensor([135] * 7 + [5] * 3 + [0], dtype=torch.int32))
+    if use_logical_indices:
+        assert indices[0, 0, 0] == 128
+        assert indices[0, 0, 134] == 262
+    else:
+        assert indices[0, 0, 0] == 1408
+
+
+def test_dspark_swa_buffers_keep_addresses_and_clear_shorter_replay():
+    indices_buffer = torch.full((16, 1, 256), 123, dtype=torch.int32)
+    lengths_buffer = torch.full((16, 1), 123, dtype=torch.int32)
+    for seq_len, query_len in [(263, 7), (5, 3)]:
+        indices, lengths = build_dspark_swa_indices(
+            torch.tensor([[7, 11, 13]], dtype=torch.int32),
+            num_speculative_tokens=7,
+            window_size=128,
+            block_size=128,
+            query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+            num_decode_tokens=query_len,
+            buffer=indices_buffer,
+            use_logical_indices=True,
+            lengths_buffer=lengths_buffer,
+        )
+        assert indices.data_ptr() == indices_buffer.data_ptr()
+        assert lengths.data_ptr() == lengths_buffer.data_ptr()
+        assert torch.all(indices_buffer[query_len:] == -1)
+        assert torch.count_nonzero(lengths_buffer[query_len:]) == 0
+        torch.testing.assert_close(lengths, (indices >= 0).sum(dim=(1, 2), dtype=torch.int32))
+    assert torch.all(lengths_buffer[:3] == 5)
+
+
+@pytest.mark.parametrize(
+    ("draft_path", "has_prefill"), [(False, False), (True, False), (True, True)], ids=["main", "draft", "draft_prefill"]
+)
+@pytest.mark.parametrize("deferred", [False, True], ids=["eager_metadata", "device_metadata"])
+@pytest.mark.parametrize("uses_sparse_flash_mla", [False, True], ids=["physical_slots", "bf16_logical"])
+def test_dspark_swa_metadata_and_attention_contract(
+    draft_path: bool, has_prefill: bool, deferred: bool, uses_sparse_flash_mla: bool
+):
+    builder = _make_builder(1, num_speculative_tokens=7, window_size=128)
+    if deferred:
+        builder.enable_dspark_device_metadata(max_num_tokens=16)
+    builder._build_qli_metadata = MagicMock(return_value=None)
+    builder.num_actual_tokens = 8
+    builder.num_decode_tokens = 8
+    builder.num_prefills = int(has_prefill)
+    builder.seq_lens = torch.tensor([263, 0], dtype=torch.int32)
+    builder.block_table = torch.tensor([[7, 11, 13], [3, 5, 8]], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 7, 8], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=builder.seq_lens,
+        _seq_lens_cpu=builder.seq_lens,
+        causal=False,
+    )
+    metadata_op = MagicMock(return_value=torch.arange(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    attention_op = MagicMock(return_value=(torch.empty(8, 1, 2),))
+    plan = _mock_dsa_kv_plan(
+        get_dsa_sparse_attn_metadata_kwargs={},
+        get_dsa_sparse_attn_metadata_op=metadata_op,
+        get_dsa_sparse_attn_base_kwargs={},
+        get_dsa_sparse_attn_op=attention_op,
+    )
+    plan.uses_sparse_flash_mla = uses_sparse_flash_mla
+    plan.view_quant_cache.side_effect = lambda cache: cache
+    if uses_sparse_flash_mla:
+        # A dense tiling cached by another group must not hide sparse SWA metadata.
+        builder.common_ratio_to_sas_metadata["c1"] = torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32)
+    with (
+        patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
+        patch("vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=2),
+        patch.object(DeviceOperator, "get_dsa_decode_cu_seqlens_ori_kv", return_value=None),
+        patch.object(DeviceOperator, "get_dsa_decode_cu_seqlens_cmp_kv", return_value=None),
+    ):
+        if draft_path:
+            req = builder.build_req_metadata_for_drafting(1, common, torch.ones(8), torch.zeros(8))
+        else:
+            req = builder.build_req_metadata(common, builder.seq_lens, None, torch.ones(8), torch.zeros(8))
+        tasks = builder.take_device_metadata_tasks()
+        if deferred and not has_prefill:
+            metadata_op.assert_not_called()
+            assert len(tasks) == 1
+            assert tasks[0].stage == DeviceMetadataStage.ATTENTION
+            tasks[0].run()
+        else:
+            assert not tasks
+        metadata_op.assert_called_once()
+        meta_kwargs = metadata_op.call_args.kwargs
+        req.cos = {"layer": torch.ones(8, 1, 1, 2)}
+        req.sin = {"layer": torch.zeros(8, 1, 1, 2)}
+        impl = _make_impl()
+        layer_metadata = AscendDSALayerMetadata(
+            attention=None,
+            swa=AscendDSAMetadata(
+                8, 0 if has_prefill else 2, 0 if has_prefill else 8, int(has_prefill), req_metadata=req
+            ),
+        )
+        with (
+            patch.object(
+                DeviceOperator, "unpack_dsa_forward_kv_cache", return_value=tuple(torch.empty(0) for _ in range(6))
+            ),
+            patch.object(impl, "_mla_prolog_single_stream", return_value=(torch.empty(8, 1, 2), torch.empty(0), None)),
+            patch("vllm_ascend.attention.dsa_v1.notify_kv_cache_written"),
+            patch("vllm_ascend.attention.dsa_v1.wait_for_device_metadata") as wait,
+        ):
+            impl._forward_attention("layer", torch.empty(8, 4), (torch.empty(0),), layer_metadata)
+        wait.assert_called_once_with(DeviceMetadataStage.ATTENTION, id(req.sas_metadata))
+    attn_kwargs = attention_op.call_args.kwargs
+    assert attn_kwargs["ori_sparse_indices"] is req.dspark_swa_indices
+    shared_keys = ["cu_seqlens_q", "seqused_kv", "ori_mask_mode"]
+    if uses_sparse_flash_mla or draft_path:
+        shared_keys.extend(["ori_win_left", "ori_win_right"])
+    for key in shared_keys:
+        if isinstance(meta_kwargs[key], torch.Tensor):
+            assert meta_kwargs[key] is attn_kwargs[key]
+        else:
+            assert meta_kwargs[key] == attn_kwargs[key]
+    if uses_sparse_flash_mla:
+        assert req.dspark_swa_indices[0, 0, 0] == 128
+        assert meta_kwargs["ori_topk"] == 256
+        assert meta_kwargs["ori_topk_length"] is req.dspark_swa_lengths
+        assert attn_kwargs["ori_topk_length"] is req.dspark_swa_lengths
+        assert meta_kwargs["ori_mask_mode"] == meta_kwargs["cmp_mask_mode"] == attn_kwargs["cmp_mask_mode"] == 0
+        assert meta_kwargs["ori_win_left"] == meta_kwargs["ori_win_right"] == -1
+        assert attn_kwargs["topk_value_mode"] == 1
+        torch.testing.assert_close(req.dspark_swa_lengths[:, 0], torch.tensor([135] * 7 + [0], dtype=torch.int32))
+        assert req.dspark_swa_lengths.data_ptr() == builder.dspark_swa_lengths_buffer.data_ptr()
+    else:
+        assert req.dspark_swa_indices[0, 0, 0] == 1408
+        assert req.dspark_swa_lengths is None
+        assert "ori_topk" not in meta_kwargs
+        assert "ori_topk_length" not in attn_kwargs
+        assert meta_kwargs["ori_mask_mode"] == 4
+        expected_window = (134, 0) if draft_path else (127, 0)
+        assert (meta_kwargs["ori_win_left"], meta_kwargs["ori_win_right"]) == expected_window
+
+
+@pytest.mark.parametrize("buffer_shape", [(8,), (8, 2), (2, 1)])
+def test_dspark_swa_rejects_invalid_lengths_buffer(buffer_shape: tuple[int, ...]):
+    with pytest.raises(ValueError, match="lengths buffer must have shape"):
+        build_dspark_swa_indices(
+            torch.tensor([[7]], dtype=torch.int32),
+            num_speculative_tokens=7,
+            window_size=128,
+            block_size=128,
+            query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([5], dtype=torch.int32),
+            num_decode_tokens=3,
+            use_logical_indices=True,
+            lengths_buffer=torch.zeros(buffer_shape, dtype=torch.int32),
         )

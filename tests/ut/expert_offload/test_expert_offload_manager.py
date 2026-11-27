@@ -757,6 +757,20 @@ def test_expert_host_allocation_and_synchronization_use_transport():
     manager.h2d_transport.synchronize.assert_called_once_with(manager.load_stream)
 
 
+def test_global_store_startup_host_allocation_is_pageable():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = SimpleNamespace(global_store_enabled=True)
+    manager.h2d_transport = MagicMock()
+
+    result = manager._allocate_expert_host_tensor((2, 4), torch.float32)
+
+    assert result.shape == (2, 4)
+    assert result.dtype == torch.float32
+    assert result.device.type == "cpu"
+    assert not result.is_pinned()
+    manager.h2d_transport.allocate_host_tensor.assert_not_called()
+
+
 def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})
